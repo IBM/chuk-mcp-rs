@@ -19,6 +19,7 @@ use chuk_mcp::protocol::types::info::ServerInfo;
 use chuk_mcp::server::McpServer as CoreServer;
 use chuk_mcp::transports::stdio::{StdioParameters as CoreStdioParameters, StdioTransport};
 
+mod http;
 mod streams;
 mod types;
 use types::{
@@ -96,6 +97,11 @@ impl PyStdioParameters {
     #[getter]
     fn args(&self) -> Vec<String> {
         self.inner.args.clone()
+    }
+
+    #[getter]
+    fn env(&self) -> Option<HashMap<String, String>> {
+        self.inner.env.clone()
     }
 
     fn __repr__(&self) -> String {
@@ -457,6 +463,7 @@ fn chuk_mcp_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMcpServer>()?;
     types::register(m)?;
     streams::register(m)?;
+    http::register(m)?;
     m.add_function(wrap_pyfunction!(connect_to_server, m)?)?;
     m.add_function(wrap_pyfunction!(supported_versions, m)?)?;
     m.add_function(wrap_pyfunction!(core_version, m)?)?;
