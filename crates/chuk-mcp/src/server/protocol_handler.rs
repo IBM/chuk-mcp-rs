@@ -53,6 +53,11 @@ impl ProtocolHandler {
         self.handlers.insert(method.to_string(), handler);
     }
 
+    /// Whether a custom handler is registered for `method`.
+    pub fn has_custom_handler(&self, method: &str) -> bool {
+        self.handlers.contains_key(method)
+    }
+
     /// Handle an incoming message, producing an optional response.
     pub async fn handle_message(
         &self,

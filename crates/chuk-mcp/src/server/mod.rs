@@ -122,6 +122,17 @@ impl McpServer {
         message: JsonRpcMessage,
         session_id: Option<&str>,
     ) -> HandlerResult {
+        // A custom method handler registered on the protocol handler takes
+        // precedence over the built-in tool/resource dispatch, so servers can
+        // override tools/list, tools/call, etc. (matching the Python semantics).
+        if let Some(method) = message.method() {
+            if self.protocol_handler.has_custom_handler(method) {
+                return self
+                    .protocol_handler
+                    .handle_message(message, session_id)
+                    .await;
+            }
+        }
         match message.method() {
             Some("tools/list") => (self.handle_tools_list(&message), None),
             Some("tools/call") => (self.handle_tools_call(&message).await, None),

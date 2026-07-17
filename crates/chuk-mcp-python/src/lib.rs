@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::PyList;
+use pyo3::types::{PyDict, PyList};
 use pythonize::{depythonize, pythonize};
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -20,6 +20,7 @@ use chuk_mcp::server::McpServer as CoreServer;
 use chuk_mcp::transports::stdio::{StdioParameters as CoreStdioParameters, StdioTransport};
 
 mod http;
+mod server;
 mod streams;
 mod types;
 use types::{
@@ -331,6 +332,15 @@ impl PyMcpServer {
         })
     }
 
+    /// The server's protocol handler, for registering custom method handlers
+    /// (`server.protocol_handler.register_method(...)`).
+    #[getter]
+    fn protocol_handler(&self) -> server::PyProtocolHandler {
+        server::PyProtocolHandler {
+            server: self.inner.clone(),
+        }
+    }
+
     /// Register a tool. `handler` is an async callable taking keyword-friendly
     /// `arguments` (a dict) and returning a str or JSON-serializable value.
     #[pyo3(signature = (name, handler, schema, description=""))]
@@ -354,9 +364,16 @@ impl PyMcpServer {
             let handler = handler.clone();
             async move {
                 // Call the Python async handler and await its coroutine.
+                // Arguments are passed as keyword arguments (handler(**arguments)),
+                // matching the historical chuk_mcp.MCPServer convention
+                // (e.g. `async def greet(name): ...`). Falls back to a single
+                // positional argument if the payload isn't an object.
                 let future = Python::with_gil(|py| -> PyResult<_> {
                     let args_obj = pythonize(py, &args)?;
-                    let coroutine = handler.bind(py).call1((args_obj,))?;
+                    let coroutine = match args_obj.downcast::<PyDict>() {
+                        Ok(kwargs) => handler.bind(py).call((), Some(kwargs))?,
+                        Err(_) => handler.bind(py).call1((args_obj,))?,
+                    };
                     pyo3_async_runtimes::tokio::into_future(coroutine)
                 })
                 .map_err(|e| e.to_string())?;
@@ -464,6 +481,7 @@ fn chuk_mcp_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     types::register(m)?;
     streams::register(m)?;
     http::register(m)?;
+    server::register(m)?;
     m.add_function(wrap_pyfunction!(connect_to_server, m)?)?;
     m.add_function(wrap_pyfunction!(supported_versions, m)?)?;
     m.add_function(wrap_pyfunction!(core_version, m)?)?;

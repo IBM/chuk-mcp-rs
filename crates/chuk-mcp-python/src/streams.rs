@@ -9,9 +9,14 @@ use pyo3::prelude::*;
 use serde_json::Value;
 use tokio::sync::Mutex;
 
+use chuk_mcp::protocol::json_rpc::RequestId;
 use chuk_mcp::protocol::messages::initialize::{
     send_initialize_with_options, send_initialized_notification as core_initialized_notification,
     InitializeOptions,
+};
+use chuk_mcp::protocol::messages::notifications::{
+    send_cancelled_notification as core_cancelled, send_progress_notification as core_progress,
+    send_roots_list_changed_notification as core_roots_changed,
 };
 use chuk_mcp::protocol::messages::ping::send_ping as core_send_ping;
 use chuk_mcp::protocol::messages::prompts::{
@@ -20,6 +25,10 @@ use chuk_mcp::protocol::messages::prompts::{
 use chuk_mcp::protocol::messages::resources::{
     send_resources_list as core_resources_list, send_resources_read as core_resources_read,
 };
+use chuk_mcp::protocol::messages::resources::{
+    send_resources_subscribe as core_subscribe, send_resources_unsubscribe as core_unsubscribe,
+};
+use chuk_mcp::protocol::messages::roots::send_roots_list as core_roots_list;
 use chuk_mcp::protocol::messages::send_message::send_message as core_send_message;
 use chuk_mcp::protocol::messages::send_message::{ReadStream, WriteStream};
 use chuk_mcp::protocol::messages::tools::{
@@ -296,6 +305,118 @@ pub fn send_initialized_notification<'py>(
     })
 }
 
+fn to_request_id(value: &Bound<'_, PyAny>) -> PyResult<RequestId> {
+    if let Ok(n) = value.extract::<i64>() {
+        Ok(RequestId::Num(n))
+    } else if let Ok(s) = value.extract::<String>() {
+        Ok(RequestId::Str(s))
+    } else {
+        Err(pyo3::exceptions::PyValueError::new_err(
+            "token/id must be an int or str",
+        ))
+    }
+}
+
+/// Send a `notifications/progress` notification.
+#[pyfunction]
+#[pyo3(signature = (write, progress_token, progress, total=None, message=None))]
+pub fn send_progress_notification<'py>(
+    py: Python<'py>,
+    write: PyWriteStream,
+    progress_token: Bound<'py, PyAny>,
+    progress: f64,
+    total: Option<f64>,
+    message: Option<String>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let token = to_request_id(&progress_token)?;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        core_progress(&write.inner, token, progress, total, message.as_deref())
+            .await
+            .map_err(to_py_err)?;
+        Ok(())
+    })
+}
+
+/// Send a `notifications/cancelled` notification.
+#[pyfunction]
+#[pyo3(signature = (write, request_id, reason=None))]
+pub fn send_cancelled_notification<'py>(
+    py: Python<'py>,
+    write: PyWriteStream,
+    request_id: Bound<'py, PyAny>,
+    reason: Option<String>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let id = to_request_id(&request_id)?;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        core_cancelled(&write.inner, id, reason.as_deref())
+            .await
+            .map_err(to_py_err)?;
+        Ok(())
+    })
+}
+
+/// Send a `notifications/roots/list_changed` notification.
+#[pyfunction]
+pub fn send_roots_list_changed_notification<'py>(
+    py: Python<'py>,
+    write: PyWriteStream,
+) -> PyResult<Bound<'py, PyAny>> {
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        core_roots_changed(&write.inner).await.map_err(to_py_err)?;
+        Ok(())
+    })
+}
+
+/// Send a `roots/list` request; returns the raw result value.
+#[pyfunction]
+#[pyo3(signature = (read, write, timeout=None))]
+pub fn send_roots_list<'py>(
+    py: Python<'py>,
+    read: PyReadStream,
+    write: PyWriteStream,
+    timeout: Option<f64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let _ = timeout;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let result = core_roots_list(&read.inner, &write.inner)
+            .await
+            .map_err(to_py_err)?;
+        Python::with_gil(|py| json_to_py(py, &serde_json::to_value(result).unwrap()))
+    })
+}
+
+/// Subscribe to updates for a resource; resolves to True/False.
+#[pyfunction]
+#[pyo3(signature = (read, write, uri, timeout=None))]
+pub fn send_resources_subscribe<'py>(
+    py: Python<'py>,
+    read: PyReadStream,
+    write: PyWriteStream,
+    uri: String,
+    timeout: Option<f64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let _ = timeout;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        Ok(core_subscribe(&read.inner, &write.inner, &uri).await)
+    })
+}
+
+/// Unsubscribe from updates for a resource; resolves to True/False.
+#[pyfunction]
+#[pyo3(signature = (read, write, uri, timeout=None))]
+pub fn send_resources_unsubscribe<'py>(
+    py: Python<'py>,
+    read: PyReadStream,
+    write: PyWriteStream,
+    uri: String,
+    timeout: Option<f64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let _ = timeout;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        Ok(core_unsubscribe(&read.inner, &write.inner, &uri).await)
+    })
+}
+
 /// Register the low-level stream API on the module.
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyReadStream>()?;
@@ -312,5 +433,11 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(send_ping, m)?)?;
     m.add_function(wrap_pyfunction!(send_message, m)?)?;
     m.add_function(wrap_pyfunction!(send_initialized_notification, m)?)?;
+    m.add_function(wrap_pyfunction!(send_progress_notification, m)?)?;
+    m.add_function(wrap_pyfunction!(send_cancelled_notification, m)?)?;
+    m.add_function(wrap_pyfunction!(send_roots_list_changed_notification, m)?)?;
+    m.add_function(wrap_pyfunction!(send_roots_list, m)?)?;
+    m.add_function(wrap_pyfunction!(send_resources_subscribe, m)?)?;
+    m.add_function(wrap_pyfunction!(send_resources_unsubscribe, m)?)?;
     Ok(())
 }
