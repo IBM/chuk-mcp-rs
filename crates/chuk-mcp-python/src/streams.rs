@@ -10,9 +10,11 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use chuk_mcp::protocol::messages::initialize::{
-    send_initialize_with_options, InitializeOptions,
+    send_initialize_with_options, send_initialized_notification as core_initialized_notification,
+    InitializeOptions,
 };
 use chuk_mcp::protocol::messages::ping::send_ping as core_send_ping;
+use chuk_mcp::protocol::messages::send_message::send_message as core_send_message;
 use chuk_mcp::protocol::messages::prompts::{
     send_prompts_get as core_prompts_get, send_prompts_list as core_prompts_list,
 };
@@ -30,7 +32,7 @@ use crate::types::{
     PyGetPromptResult, PyInitializeResult, PyListPromptsResult, PyListResourcesResult,
     PyListToolsResult, PyReadResourceResult, PyToolResult,
 };
-use crate::{py_to_json, to_py_err};
+use crate::{json_to_py, py_to_json, to_py_err};
 
 /// Opaque handle to a transport's inbound message stream.
 #[pyclass(name = "ReadStream", frozen)]
@@ -256,6 +258,44 @@ pub fn send_ping<'py>(
     })
 }
 
+/// Generic low-level JSON-RPC send: returns the raw `result` value.
+#[pyfunction]
+#[pyo3(signature = (read, write, method, params=None, timeout=None))]
+pub fn send_message<'py>(
+    py: Python<'py>,
+    read: PyReadStream,
+    write: PyWriteStream,
+    method: String,
+    params: Option<Bound<'py, PyAny>>,
+    timeout: Option<f64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let _ = timeout;
+    let params: Option<Value> = match params {
+        Some(p) => Some(py_to_json(&p)?),
+        None => None,
+    };
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let result = core_send_message(&read.inner, &write.inner, &method, params)
+            .await
+            .map_err(to_py_err)?;
+        Python::with_gil(|py| json_to_py(py, &result))
+    })
+}
+
+/// Send the `notifications/initialized` notification on a stream pair.
+#[pyfunction]
+pub fn send_initialized_notification<'py>(
+    py: Python<'py>,
+    write: PyWriteStream,
+) -> PyResult<Bound<'py, PyAny>> {
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        core_initialized_notification(&write.inner)
+            .await
+            .map_err(to_py_err)?;
+        Ok(())
+    })
+}
+
 /// Register the low-level stream API on the module.
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyReadStream>()?;
@@ -270,5 +310,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(send_prompts_list, m)?)?;
     m.add_function(wrap_pyfunction!(send_prompts_get, m)?)?;
     m.add_function(wrap_pyfunction!(send_ping, m)?)?;
+    m.add_function(wrap_pyfunction!(send_message, m)?)?;
+    m.add_function(wrap_pyfunction!(send_initialized_notification, m)?)?;
     Ok(())
 }

@@ -54,6 +54,18 @@ pub(crate) fn py_to_json(value: &Bound<'_, PyAny>) -> PyResult<Value> {
     Ok(depythonize(value)?)
 }
 
+/// Like [`py_to_json`], but first unwraps Pydantic-style models via
+/// `model_dump()` so callers can pass either a dict or a model object.
+pub(crate) fn coerce_to_json(value: &Bound<'_, PyAny>) -> PyResult<Value> {
+    if let Ok(dump) = value.getattr("model_dump") {
+        if dump.is_callable() {
+            let dumped = dump.call0()?;
+            return py_to_json(&dumped);
+        }
+    }
+    py_to_json(value)
+}
+
 /// Parameters for stdio transport.
 #[pyclass(name = "StdioParameters")]
 #[derive(Clone)]
@@ -295,7 +307,7 @@ impl PyMcpServer {
     fn new(name: &str, version: &str, capabilities: Option<Bound<'_, PyAny>>) -> PyResult<Self> {
         let caps = match capabilities {
             Some(c) => {
-                let value = py_to_json(&c)?;
+                let value = coerce_to_json(&c)?;
                 Some(serde_json::from_value(value).map_err(|e| {
                     PyRuntimeError::new_err(format!("invalid capabilities: {e}"))
                 })?)
