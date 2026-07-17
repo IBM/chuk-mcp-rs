@@ -1,0 +1,23 @@
+[package]
+name = "chuk-mcp"
+description = "Model Context Protocol client and server library (Rust port of chuk-mcp)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["llm", "mcp", "client", "protocol"]
+categories = ["network-programming", "api-bindings"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

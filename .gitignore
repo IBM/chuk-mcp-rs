@@ -1,0 +1,10 @@
+/target
+Cargo.lock.bak
+
+# Python / maturin build artifacts
+*.so
+*.pyd
+__pycache__/
+*.egg-info/
+.venv/
+dist/
