@@ -145,7 +145,10 @@ mod tests {
     #[test]
     fn reference_wire_format() {
         assert_eq!(
-            serde_json::to_value(Reference::Resource { uri: "file:///x".into() }).unwrap(),
+            serde_json::to_value(Reference::Resource {
+                uri: "file:///x".into()
+            })
+            .unwrap(),
             json!({"type": "ref/resource", "uri": "file:///x"})
         );
         assert_eq!(

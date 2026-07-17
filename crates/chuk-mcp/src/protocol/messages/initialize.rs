@@ -4,8 +4,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use crate::protocol::json_rpc::JsonRpcMessage;
 use crate::protocol::json_rpc::create_notification;
+use crate::protocol::json_rpc::JsonRpcMessage;
 use crate::protocol::messages::method::MessageMethod;
 use crate::protocol::messages::send_message::{
     send_message_with_options, ReadStream, SendMessageOptions, WriteStream,
@@ -127,7 +127,10 @@ pub async fn send_initialize_with_options(
 /// VersionMismatch, matching the Python behavior.
 fn classify_init_error(error: McpError, proposed_version: &str) -> McpError {
     if error.code() == Some(INVALID_PARAMS)
-        && error.to_string().to_lowercase().contains("protocol version")
+        && error
+            .to_string()
+            .to_lowercase()
+            .contains("protocol version")
     {
         McpError::VersionMismatch {
             requested: proposed_version.to_string(),

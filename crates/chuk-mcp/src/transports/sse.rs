@@ -103,7 +103,9 @@ impl SseTransport {
         // Streaming client without a total-request timeout (the SSE stream is
         // long-lived); connection establishment is still bounded below.
         let stream_client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs_f64(parameters.timeout.min(15.0)))
+            .connect_timeout(std::time::Duration::from_secs_f64(
+                parameters.timeout.min(15.0),
+            ))
             .build()
             .map_err(|e| McpError::Transport(format!("Failed to build HTTP client: {e}")))?;
 
@@ -220,8 +222,7 @@ async fn handle_sse_connection(
                     Some("keepalive") => tracing::debug!("Received keepalive"),
                     _ => {
                         // Untyped data: endpoint announcement or JSON-RPC.
-                        let no_url =
-                            shared.message_url.lock().expect("url lock").is_none();
+                        let no_url = shared.message_url.lock().expect("url lock").is_none();
                         if no_url && (data.contains("/messages/") || data.contains("/mcp")) {
                             handle_endpoint_event(data, &params, &shared);
                         } else if data.starts_with('{') && data.contains("\"jsonrpc\"") {

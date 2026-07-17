@@ -136,7 +136,11 @@ impl StdioTransport {
             "Subprocess PID {:?} ({}) [stderr: {}]",
             child.id(),
             parameters.command,
-            if suppress_stderr { "suppressed" } else { "pass-through" }
+            if suppress_stderr {
+                "suppressed"
+            } else {
+                "pass-through"
+            }
         );
 
         let (incoming_tx, incoming) = message_channel(100);
@@ -183,9 +187,9 @@ impl StdioTransport {
                                 // Flatten inbound batches into individual messages.
                                 let messages = match msg {
                                     crate::protocol::json_rpc::JsonRpcMessage::BatchRequest(m)
-                                    | crate::protocol::json_rpc::JsonRpcMessage::BatchResponse(
-                                        m,
-                                    ) => m,
+                                    | crate::protocol::json_rpc::JsonRpcMessage::BatchResponse(m) => {
+                                        m
+                                    }
                                     single => vec![single],
                                 };
                                 for m in messages {
@@ -357,10 +361,9 @@ pub async fn stdio_client_with_initialize(
     McpError,
 > {
     let (transport, read, write) = stdio_client(parameters).await?;
-    let result = crate::protocol::messages::initialize::send_initialize_with_options(
-        &read, &write, options,
-    )
-    .await?;
+    let result =
+        crate::protocol::messages::initialize::send_initialize_with_options(&read, &write, options)
+            .await?;
     transport.set_protocol_version(&result.protocol_version);
     Ok((transport, read, write, result))
 }

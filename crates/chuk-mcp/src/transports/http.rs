@@ -234,8 +234,13 @@ async fn send_via_http(
                 let _ = incoming_tx.send(msg).await;
             }
             Err(e) => {
-                route_error(incoming_tx, &message_id, PARSE_ERROR, &format!("Parse error: {e}"))
-                    .await
+                route_error(
+                    incoming_tx,
+                    &message_id,
+                    PARSE_ERROR,
+                    &format!("Parse error: {e}"),
+                )
+                .await
             }
         }
     }

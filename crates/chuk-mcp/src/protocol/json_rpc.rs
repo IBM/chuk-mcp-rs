@@ -288,10 +288,8 @@ pub fn create_error_response(
 /// rejected, matching the Python implementation.
 pub fn parse_message(data: &Value) -> Result<JsonRpcMessage, McpError> {
     if let Value::Array(items) = data {
-        let messages: Vec<JsonRpcMessage> = items
-            .iter()
-            .map(parse_message)
-            .collect::<Result<_, _>>()?;
+        let messages: Vec<JsonRpcMessage> =
+            items.iter().map(parse_message).collect::<Result<_, _>>()?;
 
         let all_requests = messages
             .iter()
@@ -312,9 +310,9 @@ pub fn parse_message(data: &Value) -> Result<JsonRpcMessage, McpError> {
         };
     }
 
-    let obj = data.as_object().ok_or_else(|| {
-        McpError::protocol(PARSE_ERROR, "Message must be an object or array")
-    })?;
+    let obj = data
+        .as_object()
+        .ok_or_else(|| McpError::protocol(PARSE_ERROR, "Message must be an object or array"))?;
 
     if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return Err(McpError::protocol(
@@ -414,7 +412,12 @@ mod tests {
 
     #[test]
     fn progress_token_lands_in_meta() {
-        let req = create_request("tools/call", Some(json!({"name": "t"})), None, Some("tok".into()));
+        let req = create_request(
+            "tools/call",
+            Some(json!({"name": "t"})),
+            None,
+            Some("tok".into()),
+        );
         assert_eq!(req.params.unwrap()["_meta"]["progressToken"], json!("tok"));
     }
 

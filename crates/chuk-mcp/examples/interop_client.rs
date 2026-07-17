@@ -10,7 +10,9 @@ use chuk_mcp::transports::stdio::StdioParameters;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut argv = std::env::args().skip(1);
-    let command = argv.next().expect("usage: interop_client <command> [args...]");
+    let command = argv
+        .next()
+        .expect("usage: interop_client <command> [args...]");
     let params = StdioParameters::new(command, argv);
 
     let mut client = connect_to_server(params).await?;
@@ -24,7 +26,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("tools: {names:?}");
 
     if names.contains(&"greet") {
-        let result = client.call_tool("greet", json!({"name": "RustClient"})).await?;
+        let result = client
+            .call_tool("greet", json!({"name": "RustClient"}))
+            .await?;
         println!("greet: {}", result.text());
     }
     if names.contains(&"add") {

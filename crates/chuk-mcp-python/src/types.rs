@@ -23,9 +23,8 @@ fn json_to_py(py: Python<'_>, value: &Value) -> PyResult<PyObject> {
 }
 
 fn to_dict<T: Serialize>(py: Python<'_>, value: &T) -> PyResult<PyObject> {
-    let json = serde_json::to_value(value).map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("serialize error: {e}"))
-    })?;
+    let json = serde_json::to_value(value)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("serialize error: {e}")))?;
     json_to_py(py, &json)
 }
 
@@ -173,7 +172,10 @@ impl PyResource {
         to_dict(py, &self.inner)
     }
     fn __repr__(&self) -> String {
-        format!("Resource(uri={:?}, name={:?})", self.inner.uri, self.inner.name)
+        format!(
+            "Resource(uri={:?}, name={:?})",
+            self.inner.uri, self.inner.name
+        )
     }
 }
 
@@ -492,7 +494,10 @@ impl PyListResourcesResult {
         to_dict(py, &self.inner)
     }
     fn __repr__(&self) -> String {
-        format!("ListResourcesResult(resources={})", self.inner.resources.len())
+        format!(
+            "ListResourcesResult(resources={})",
+            self.inner.resources.len()
+        )
     }
 }
 

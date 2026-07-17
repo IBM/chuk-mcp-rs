@@ -3,6 +3,7 @@
 use serde_json::Value;
 
 use crate::protocol::messages::initialize::{send_initialize, InitializeResult};
+use crate::protocol::messages::ping::send_ping;
 use crate::protocol::messages::prompts::{
     send_prompts_get, send_prompts_list, GetPromptResult, Prompt,
 };
@@ -11,7 +12,6 @@ use crate::protocol::messages::resources::{
 };
 use crate::protocol::messages::send_message::{ReadStream, WriteStream};
 use crate::protocol::messages::tools::{send_tools_call, send_tools_list, Tool, ToolResult};
-use crate::protocol::messages::ping::send_ping;
 use crate::protocol::types::capabilities::ServerCapabilities;
 use crate::protocol::types::errors::McpError;
 use crate::protocol::types::info::ServerInfo;
@@ -52,7 +52,8 @@ impl McpClient {
 
         self.server_info = Some(result.server_info.clone());
         self.capabilities = Some(result.capabilities.clone());
-        self.transport.set_protocol_version(&result.protocol_version);
+        self.transport
+            .set_protocol_version(&result.protocol_version);
         self.streams = Some((read, write));
 
         tracing::info!("Initialized connection to {}", result.server_info.name);

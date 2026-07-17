@@ -6,7 +6,10 @@ use chuk_mcp::client::connect_to_server;
 use chuk_mcp::transports::stdio::StdioParameters;
 
 fn demo_server_params() -> StdioParameters {
-    StdioParameters::new(env!("CARGO_BIN_EXE_chuk-mcp-demo-server"), Vec::<String>::new())
+    StdioParameters::new(
+        env!("CARGO_BIN_EXE_chuk-mcp-demo-server"),
+        Vec::<String>::new(),
+    )
 }
 
 #[tokio::test]

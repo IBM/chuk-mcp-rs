@@ -77,7 +77,11 @@ struct PyStdioParameters {
 impl PyStdioParameters {
     #[new]
     #[pyo3(signature = (command, args=None, env=None))]
-    fn new(command: String, args: Option<Vec<String>>, env: Option<HashMap<String, String>>) -> Self {
+    fn new(
+        command: String,
+        args: Option<Vec<String>>,
+        env: Option<HashMap<String, String>>,
+    ) -> Self {
         let mut params = CoreStdioParameters::new(command, args.unwrap_or_default());
         params.env = env;
         PyStdioParameters { inner: params }
@@ -183,7 +187,10 @@ impl PyMcpClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let resources =
                 with_client!(client, client.list_resources().await).map_err(to_py_err)?;
-            Ok(resources.into_iter().map(PyResource::from).collect::<Vec<_>>())
+            Ok(resources
+                .into_iter()
+                .map(PyResource::from)
+                .collect::<Vec<_>>())
         })
     }
 
@@ -201,8 +208,7 @@ impl PyMcpClient {
     fn list_prompts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.client();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let prompts =
-                with_client!(client, client.list_prompts().await).map_err(to_py_err)?;
+            let prompts = with_client!(client, client.list_prompts().await).map_err(to_py_err)?;
             Ok(prompts.into_iter().map(PyPrompt::from).collect::<Vec<_>>())
         })
     }
@@ -221,8 +227,8 @@ impl PyMcpClient {
             None => None,
         };
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let result = with_client!(client, client.get_prompt(&name, args).await)
-                .map_err(to_py_err)?;
+            let result =
+                with_client!(client, client.get_prompt(&name, args).await).map_err(to_py_err)?;
             Ok(PyGetPromptResult::from(result))
         })
     }
@@ -260,7 +266,11 @@ impl PyMcpClient {
     }
 
     #[pyo3(signature = (*_args))]
-    fn __aexit__<'py>(&self, py: Python<'py>, _args: Bound<'py, pyo3::types::PyTuple>) -> PyResult<Bound<'py, PyAny>> {
+    fn __aexit__<'py>(
+        &self,
+        py: Python<'py>,
+        _args: Bound<'py, pyo3::types::PyTuple>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         self.close(py)
     }
 }
@@ -305,15 +315,16 @@ impl PyMcpServer {
     #[new]
     #[pyo3(signature = (name, version="1.0.0", capabilities=None))]
     fn new(name: &str, version: &str, capabilities: Option<Bound<'_, PyAny>>) -> PyResult<Self> {
-        let caps = match capabilities {
-            Some(c) => {
-                let value = coerce_to_json(&c)?;
-                Some(serde_json::from_value(value).map_err(|e| {
-                    PyRuntimeError::new_err(format!("invalid capabilities: {e}"))
-                })?)
-            }
-            None => None,
-        };
+        let caps =
+            match capabilities {
+                Some(c) => {
+                    let value = coerce_to_json(&c)?;
+                    Some(serde_json::from_value(value).map_err(|e| {
+                        PyRuntimeError::new_err(format!("invalid capabilities: {e}"))
+                    })?)
+                }
+                None => None,
+            };
         Ok(PyMcpServer {
             inner: Arc::new(Mutex::new(Some(CoreServer::new(name, version, caps)))),
         })
@@ -459,8 +470,14 @@ fn chuk_mcp_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("McpError", py.get_type::<McpError>())?;
     m.add("RetryableError", py.get_type::<RetryableError>())?;
     m.add("NonRetryableError", py.get_type::<NonRetryableError>())?;
-    m.add("VersionMismatchError", py.get_type::<VersionMismatchError>())?;
+    m.add(
+        "VersionMismatchError",
+        py.get_type::<VersionMismatchError>(),
+    )?;
     m.add("ValidationError", py.get_type::<ValidationError>())?;
-    m.add("CURRENT_VERSION", chuk_mcp::protocol::versioning::CURRENT_VERSION)?;
+    m.add(
+        "CURRENT_VERSION",
+        chuk_mcp::protocol::versioning::CURRENT_VERSION,
+    )?;
     Ok(())
 }

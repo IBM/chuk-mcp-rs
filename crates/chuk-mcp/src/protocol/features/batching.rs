@@ -80,10 +80,7 @@ impl BatchProcessor {
 
     /// Build the JSON-RPC error object sent when a batch is rejected.
     pub fn create_batch_rejection_error(&self, message_id: Option<Value>) -> Value {
-        let version = self
-            .protocol_version
-            .as_deref()
-            .unwrap_or("unknown");
+        let version = self.protocol_version.as_deref().unwrap_or("unknown");
         json!({
             "jsonrpc": "2.0",
             "id": message_id,

@@ -14,13 +14,13 @@ use chuk_mcp::protocol::messages::initialize::{
     InitializeOptions,
 };
 use chuk_mcp::protocol::messages::ping::send_ping as core_send_ping;
-use chuk_mcp::protocol::messages::send_message::send_message as core_send_message;
 use chuk_mcp::protocol::messages::prompts::{
     send_prompts_get as core_prompts_get, send_prompts_list as core_prompts_list,
 };
 use chuk_mcp::protocol::messages::resources::{
     send_resources_list as core_resources_list, send_resources_read as core_resources_read,
 };
+use chuk_mcp::protocol::messages::send_message::send_message as core_send_message;
 use chuk_mcp::protocol::messages::send_message::{ReadStream, WriteStream};
 use chuk_mcp::protocol::messages::tools::{
     send_tools_call as core_tools_call, send_tools_list as core_tools_list,

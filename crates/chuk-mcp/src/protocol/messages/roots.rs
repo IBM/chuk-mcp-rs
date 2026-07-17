@@ -71,19 +71,17 @@ pub fn handle_roots_list_request(roots: &[Root], request_id: RequestId) -> JsonR
 /// Convert a filesystem path to a `file://` root.
 pub fn create_file_root(path: &std::path::Path, name: Option<String>) -> Result<Root, McpError> {
     let abs = std::path::absolute(path)?;
-    let name = name.or_else(|| {
-        abs.file_name()
-            .map(|n| n.to_string_lossy().to_string())
-    });
+    let name = name.or_else(|| abs.file_name().map(|n| n.to_string_lossy().to_string()));
     let uri = format!("file://{}", abs.to_string_lossy());
     Root::new(uri, name)
 }
 
 /// Extract the filesystem path from a `file://` root.
 pub fn parse_file_root(root: &Root) -> Result<std::path::PathBuf, McpError> {
-    let path = root.uri.strip_prefix("file://").ok_or_else(|| {
-        McpError::validation(format!("Not a file URI: {}", root.uri))
-    })?;
+    let path = root
+        .uri
+        .strip_prefix("file://")
+        .ok_or_else(|| McpError::validation(format!("Not a file URI: {}", root.uri)))?;
     Ok(std::path::PathBuf::from(path))
 }
 

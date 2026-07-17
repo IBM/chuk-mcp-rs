@@ -26,7 +26,12 @@ pub async fn send_progress_notification(
         params["message"] = json!(message);
     }
 
-    send_notification(write_stream, MessageMethod::NOTIFICATION_PROGRESS, Some(params)).await
+    send_notification(
+        write_stream,
+        MessageMethod::NOTIFICATION_PROGRESS,
+        Some(params),
+    )
+    .await
 }
 
 /// Send a cancellation notification for a previously-issued request.
@@ -39,7 +44,12 @@ pub async fn send_cancelled_notification(
     if let Some(reason) = reason {
         params["reason"] = json!(reason);
     }
-    send_notification(write_stream, MessageMethod::NOTIFICATION_CANCELLED, Some(params)).await
+    send_notification(
+        write_stream,
+        MessageMethod::NOTIFICATION_CANCELLED,
+        Some(params),
+    )
+    .await
 }
 
 /// Send a notification that the roots list has changed.
@@ -87,7 +97,10 @@ pub fn parse_progress_notification(msg: &JsonRpcMessage) -> Option<ProgressNotif
         progress_token: params
             .get("progressToken")
             .and_then(|v| serde_json::from_value(v.clone()).ok()),
-        progress: params.get("progress").and_then(Value::as_f64).unwrap_or(0.0),
+        progress: params
+            .get("progress")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0),
         total: params.get("total").and_then(Value::as_f64),
         message: params
             .get("message")

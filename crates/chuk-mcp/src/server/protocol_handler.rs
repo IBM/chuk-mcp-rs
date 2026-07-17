@@ -148,12 +148,7 @@ impl ProtocolHandler {
     }
 
     /// Build an error response bound to the message's id (or a null-ish id).
-    fn error_for(
-        &self,
-        message: &JsonRpcMessage,
-        code: i64,
-        text: &str,
-    ) -> Option<JsonRpcMessage> {
+    fn error_for(&self, message: &JsonRpcMessage, code: i64, text: &str) -> Option<JsonRpcMessage> {
         let id = message
             .id()
             .cloned()
@@ -220,10 +215,7 @@ mod tests {
             json!("2025-06-18")
         );
         assert!(session.is_some());
-        assert_eq!(
-            handler.session_manager.lock().unwrap().session_count(),
-            1
-        );
+        assert_eq!(handler.session_manager.lock().unwrap().session_count(), 1);
     }
 
     #[tokio::test]

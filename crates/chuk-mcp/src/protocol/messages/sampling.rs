@@ -189,12 +189,8 @@ mod tests {
 
     #[test]
     fn preferences_wire_names() {
-        let prefs = create_model_preferences(
-            Some(vec!["claude".to_string()]),
-            Some(0.2),
-            None,
-            Some(0.9),
-        );
+        let prefs =
+            create_model_preferences(Some(vec!["claude".to_string()]), Some(0.2), None, Some(0.9));
         let value = serde_json::to_value(&prefs).unwrap();
         assert_eq!(value["costPriority"], json!(0.2));
         assert_eq!(value["intelligencePriority"], json!(0.9));

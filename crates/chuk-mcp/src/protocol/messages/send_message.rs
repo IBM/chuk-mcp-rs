@@ -8,9 +8,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::sync::{mpsc, Mutex, Notify};
 
-use crate::protocol::json_rpc::{
-    create_request, JsonRpcMessage, ProgressToken, RequestId,
-};
+use crate::protocol::json_rpc::{create_request, JsonRpcMessage, ProgressToken, RequestId};
 use crate::protocol::messages::method::MessageMethod;
 use crate::protocol::messages::notifications::send_cancelled_notification;
 use crate::protocol::types::errors::{get_error_message, McpError};
@@ -159,7 +157,8 @@ pub async fn send_message_with_options(
 
 /// Send a cancellation notification for `req_id` and return the Cancelled error.
 async fn cancel_and_report(write_stream: &WriteStream, req_id: &RequestId) -> McpError {
-    if let Err(e) = send_cancelled_notification(write_stream, req_id.clone(), Some("Cancelled by client")).await
+    if let Err(e) =
+        send_cancelled_notification(write_stream, req_id.clone(), Some("Cancelled by client")).await
     {
         tracing::error!("Failed to send cancellation notification: {e}");
     }
@@ -207,7 +206,10 @@ async fn await_response(
                     .unwrap_or(false);
                 if matches {
                     callback(
-                        params.get("progress").and_then(Value::as_f64).unwrap_or(0.0),
+                        params
+                            .get("progress")
+                            .and_then(Value::as_f64)
+                            .unwrap_or(0.0),
                         params.get("total").and_then(Value::as_f64),
                         params
                             .get("message")
@@ -272,9 +274,7 @@ mod tests {
     async fn matches_response_by_id() {
         let (read, inject, write, mut sent) = fake_transport();
 
-        let client = tokio::spawn(async move {
-            send_message(&read, &write, "ping", None).await
-        });
+        let client = tokio::spawn(async move { send_message(&read, &write, "ping", None).await });
 
         let request = sent.recv().await.unwrap();
         let id = request.id().unwrap().clone();

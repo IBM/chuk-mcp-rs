@@ -20,9 +20,8 @@ pub use session::{SessionInfo, SessionManager};
 
 /// An async tool handler: arguments object in, JSON value (or error text) out.
 /// String results become text content; other values are pretty-printed JSON.
-pub type ToolHandler = Arc<
-    dyn Fn(Value) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send>> + Send + Sync,
->;
+pub type ToolHandler =
+    Arc<dyn Fn(Value) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send>> + Send + Sync>;
 
 /// An async resource handler: returns the resource body as a string.
 pub type ResourceHandler =
@@ -128,7 +127,11 @@ impl McpServer {
             Some("tools/call") => (self.handle_tools_call(&message).await, None),
             Some("resources/list") => (self.handle_resources_list(&message), None),
             Some("resources/read") => (self.handle_resources_read(&message).await, None),
-            _ => self.protocol_handler.handle_message(message, session_id).await,
+            _ => {
+                self.protocol_handler
+                    .handle_message(message, session_id)
+                    .await
+            }
         }
     }
 
@@ -145,7 +148,10 @@ impl McpServer {
             })
             .collect();
         let id = message.id()?.clone();
-        Some(self.protocol_handler.create_response(id, Some(json!({"tools": tools}))))
+        Some(
+            self.protocol_handler
+                .create_response(id, Some(json!({"tools": tools}))),
+        )
     }
 
     async fn handle_tools_call(&self, message: &JsonRpcMessage) -> Option<JsonRpcMessage> {
@@ -163,10 +169,10 @@ impl McpServer {
         };
 
         match (tool.handler)(arguments).await {
-            Ok(result) => Some(self.protocol_handler.create_response(
-                id,
-                Some(json!({"content": format_content(&result)})),
-            )),
+            Ok(result) => Some(
+                self.protocol_handler
+                    .create_response(id, Some(json!({"content": format_content(&result)}))),
+            ),
             Err(e) => {
                 tracing::error!("Tool execution error for {tool_name}: {e}");
                 Some(self.protocol_handler.create_error_response(
@@ -256,8 +262,7 @@ impl McpServer {
                 }
             };
 
-            let (response, new_session) =
-                self.handle_message(message, session_id.as_deref()).await;
+            let (response, new_session) = self.handle_message(message, session_id.as_deref()).await;
             if let Some(new_session) = new_session {
                 session_id = Some(new_session);
             }
@@ -316,8 +321,8 @@ mod tests {
     async fn tools_roundtrip() {
         let server = server();
 
-        let list = parse_message(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
-            .unwrap();
+        let list =
+            parse_message(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).unwrap();
         let (response, _) = server.handle_message(list, None).await;
         let result = response.unwrap();
         assert_eq!(result.result().unwrap()["tools"][0]["name"], json!("greet"));
