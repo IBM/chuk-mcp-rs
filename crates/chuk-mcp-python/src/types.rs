@@ -16,7 +16,9 @@ use chuk_mcp::protocol::messages::resources::{
     ListResourcesResult, ReadResourceResult, Resource, ResourceContent,
 };
 use chuk_mcp::protocol::messages::tools::{ListToolsResult, Tool, ToolResult};
+use chuk_mcp::protocol::types::capabilities::ServerCapabilities as CoreServerCapabilities;
 use chuk_mcp::protocol::types::info::ServerInfo;
+use serde_json::Map;
 
 fn json_to_py(py: Python<'_>, value: &Value) -> PyResult<PyObject> {
     Ok(pythonize(py, value)?.unbind())
@@ -26,6 +28,140 @@ fn to_dict<T: Serialize>(py: Python<'_>, value: &T) -> PyResult<PyObject> {
     let json = serde_json::to_value(value)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("serialize error: {e}")))?;
     json_to_py(py, &json)
+}
+
+/// One capability section (e.g. the value of `capabilities.tools`).
+///
+/// Present sections are always truthy (matching the Pydantic models, where an
+/// empty `ToolsCapability()` object is still truthy), and expose their fields
+/// both by attribute (`caps.tools.listChanged`) and item (`caps.tools["listChanged"]`).
+#[pyclass(name = "CapabilitySection", frozen)]
+#[derive(Clone)]
+pub struct PyCapabilitySection {
+    data: Map<String, Value>,
+}
+
+#[pymethods]
+impl PyCapabilitySection {
+    fn __bool__(&self) -> bool {
+        true
+    }
+
+    fn __getattr__(&self, py: Python<'_>, name: &str) -> PyResult<PyObject> {
+        // Don't intercept dunder lookups.
+        if name.starts_with("__") && name.ends_with("__") {
+            return Err(pyo3::exceptions::PyAttributeError::new_err(
+                name.to_string(),
+            ));
+        }
+        match self.data.get(name) {
+            Some(v) => json_to_py(py, v),
+            None => Ok(py.None()),
+        }
+    }
+
+    fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<PyObject> {
+        match self.data.get(key) {
+            Some(v) => json_to_py(py, v),
+            None => Err(pyo3::exceptions::PyKeyError::new_err(key.to_string())),
+        }
+    }
+
+    #[pyo3(signature = (key, default=None))]
+    fn get(&self, py: Python<'_>, key: &str, default: Option<PyObject>) -> PyResult<PyObject> {
+        match self.data.get(key) {
+            Some(v) => json_to_py(py, v),
+            None => Ok(default.unwrap_or_else(|| py.None())),
+        }
+    }
+
+    fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+        json_to_py(py, &Value::Object(self.data.clone()))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "CapabilitySection({:?})",
+            self.data.keys().collect::<Vec<_>>()
+        )
+    }
+}
+
+fn to_section<T: Serialize>(opt: &Option<T>) -> Option<PyCapabilitySection> {
+    opt.as_ref().map(|v| {
+        let data = serde_json::to_value(v)
+            .ok()
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        PyCapabilitySection { data }
+    })
+}
+
+/// Capabilities a server supports. Sections are `None` when absent and a
+/// (truthy) [`PyCapabilitySection`] when present.
+#[pyclass(name = "ServerCapabilities", frozen)]
+#[derive(Clone)]
+pub struct PyServerCapabilities {
+    pub(crate) inner: CoreServerCapabilities,
+}
+
+#[pymethods]
+impl PyServerCapabilities {
+    #[getter]
+    fn tools(&self) -> Option<PyCapabilitySection> {
+        to_section(&self.inner.tools)
+    }
+    #[getter]
+    fn resources(&self) -> Option<PyCapabilitySection> {
+        to_section(&self.inner.resources)
+    }
+    #[getter]
+    fn prompts(&self) -> Option<PyCapabilitySection> {
+        to_section(&self.inner.prompts)
+    }
+    #[getter]
+    fn logging(&self) -> Option<PyCapabilitySection> {
+        to_section(&self.inner.logging)
+    }
+    #[getter]
+    fn completion(&self) -> Option<PyCapabilitySection> {
+        to_section(&self.inner.completion)
+    }
+    #[getter]
+    fn experimental(&self, py: Python<'_>) -> PyResult<PyObject> {
+        match &self.inner.experimental {
+            Some(m) => to_dict(py, m),
+            None => Ok(py.None()),
+        }
+    }
+    fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+        to_dict(py, &self.inner)
+    }
+    fn __repr__(&self) -> String {
+        let mut present = Vec::new();
+        if self.inner.tools.is_some() {
+            present.push("tools");
+        }
+        if self.inner.resources.is_some() {
+            present.push("resources");
+        }
+        if self.inner.prompts.is_some() {
+            present.push("prompts");
+        }
+        if self.inner.logging.is_some() {
+            present.push("logging");
+        }
+        if self.inner.completion.is_some() {
+            present.push("completion");
+        }
+        format!("ServerCapabilities({})", present.join(", "))
+    }
+}
+
+impl From<CoreServerCapabilities> for PyServerCapabilities {
+    fn from(inner: CoreServerCapabilities) -> Self {
+        PyServerCapabilities { inner }
+    }
 }
 
 /// Information about the server implementation.
@@ -413,8 +549,8 @@ impl PyInitializeResult {
         PyServerInfo::from(self.inner.server_info.clone())
     }
     #[getter]
-    fn capabilities(&self, py: Python<'_>) -> PyResult<PyObject> {
-        to_dict(py, &self.inner.capabilities)
+    fn capabilities(&self) -> PyServerCapabilities {
+        PyServerCapabilities::from(self.inner.capabilities.clone())
     }
     #[getter]
     fn instructions(&self) -> Option<&str> {
@@ -545,6 +681,8 @@ impl From<ListPromptsResult> for PyListPromptsResult {
 
 /// Register all typed classes on the module.
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyCapabilitySection>()?;
+    m.add_class::<PyServerCapabilities>()?;
     m.add_class::<PyServerInfo>()?;
     m.add_class::<PyTool>()?;
     m.add_class::<PyToolResult>()?;

@@ -2,11 +2,26 @@
 
 use serde_json::{json, Value};
 
+use chuk_mcp::protocol::types::capabilities::{
+    ResourcesCapability, ServerCapabilities, ToolsCapability,
+};
 use chuk_mcp::server::McpServer;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let mut server = McpServer::new("chuk-mcp-demo", env!("CARGO_PKG_VERSION"), None);
+    let capabilities = ServerCapabilities {
+        tools: Some(ToolsCapability {
+            list_changed: Some(true),
+            ..Default::default()
+        }),
+        resources: Some(ResourcesCapability::default()),
+        ..Default::default()
+    };
+    let mut server = McpServer::new(
+        "chuk-mcp-demo",
+        env!("CARGO_PKG_VERSION"),
+        Some(capabilities),
+    );
 
     server.register_tool(
         "greet",

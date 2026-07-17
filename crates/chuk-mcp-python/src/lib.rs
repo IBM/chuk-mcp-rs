@@ -14,6 +14,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use chuk_mcp::client::McpClient as CoreClient;
+use chuk_mcp::protocol::types::capabilities::ServerCapabilities as CoreServerCapabilities;
 use chuk_mcp::protocol::types::info::ServerInfo;
 use chuk_mcp::server::McpServer as CoreServer;
 use chuk_mcp::transports::stdio::{StdioParameters as CoreStdioParameters, StdioTransport};
@@ -21,8 +22,8 @@ use chuk_mcp::transports::stdio::{StdioParameters as CoreStdioParameters, StdioT
 mod streams;
 mod types;
 use types::{
-    PyGetPromptResult, PyPrompt, PyReadResourceResult, PyResource, PyServerInfo, PyTool,
-    PyToolResult,
+    PyGetPromptResult, PyPrompt, PyReadResourceResult, PyResource, PyServerCapabilities,
+    PyServerInfo, PyTool, PyToolResult,
 };
 
 // Exception hierarchy mirroring chuk_mcp: a base McpError with retryable /
@@ -116,7 +117,7 @@ impl PyStdioParameters {
 struct PyMcpClient {
     inner: Arc<Mutex<Option<CoreClient>>>,
     server_info: Option<ServerInfo>,
-    capabilities: Option<Value>,
+    capabilities: Option<CoreServerCapabilities>,
 }
 
 impl PyMcpClient {
@@ -143,13 +144,10 @@ impl PyMcpClient {
         self.server_info.clone().map(PyServerInfo::from)
     }
 
-    /// Server capabilities from initialization, as a dict (or None).
+    /// Server capabilities from initialization (a ServerCapabilities, or None).
     #[getter]
-    fn capabilities(&self, py: Python<'_>) -> PyResult<PyObject> {
-        match &self.capabilities {
-            Some(caps) => json_to_py(py, caps),
-            None => Ok(py.None()),
-        }
+    fn capabilities(&self) -> Option<PyServerCapabilities> {
+        self.capabilities.clone().map(PyServerCapabilities::from)
     }
 
     /// List available tools (list of Tool objects).
@@ -290,10 +288,7 @@ fn connect_to_server<'py>(
         client.initialize().await.map_err(to_py_err)?;
 
         let server_info = client.server_info.clone();
-        let capabilities = client
-            .capabilities
-            .as_ref()
-            .map(|c| serde_json::to_value(c).unwrap());
+        let capabilities = client.capabilities.clone();
 
         Ok(PyMcpClient {
             inner: Arc::new(Mutex::new(Some(client))),
