@@ -5,6 +5,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+# This is a PyO3 extension module published to PyPI (as chuk-mcp-rs) via
+# maturin, not to crates.io.
+publish = false
 
 [lib]
 name = "chuk_mcp_rs"

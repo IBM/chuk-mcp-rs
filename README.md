@@ -8,8 +8,12 @@ The workspace has two crates:
 
 | Crate | What it is |
 | --- | --- |
-| [`crates/chuk-mcp`](crates/chuk-mcp) | The core Rust library — protocol types, JSON-RPC, transports, client, server. Publishable to crates.io. |
-| [`crates/chuk-mcp-python`](crates/chuk-mcp-python) | PyO3/maturin bindings exposing the core to Python as the `chuk_mcp_rs` module. |
+| [`crates/chuk-mcp`](crates/chuk-mcp) | The core Rust library — protocol types, JSON-RPC, transports, client, server. Published to crates.io as [`chuk-mcp`](https://crates.io/crates/chuk-mcp). |
+| [`crates/chuk-mcp-python`](crates/chuk-mcp-python) | PyO3/maturin bindings exposing the core to Python as the `chuk_mcp_rs` module (published to PyPI as `chuk-mcp-rs`). |
+
+The bindings are what the existing [`chuk-mcp`](https://github.com/chrishayuk/chuk-mcp)
+Python package re-exports, so `import chuk_mcp` keeps working while being powered
+by Rust.
 
 ## Status
 
@@ -20,6 +24,12 @@ Full-parity port of the Python package's public surface:
 - **Transports** — stdio (subprocess), Streamable HTTP (2025-03-26), and the legacy SSE transport.
 - **Client** — high-level `McpClient` (initialize / list & call tools / read resources / get prompts / ping).
 - **Server** — `McpServer` with tool/resource registration, a protocol handler, and in-memory sessions.
+
+The Python bindings expose this whole surface: the high-level client and server,
+the low-level `stdio_client`/`send_*` API, the Streamable HTTP transport, the
+`ProtocolHandler` (`register_method`/`create_response`/`handle_message`), typed
+result objects (`tool.name`, `result.text`, `caps.tools`), and the error
+hierarchy — so downstream consumers keep the exact same import paths.
 
 Wire compatibility is verified in both directions: the Rust client talks to the
 Python `chuk_mcp` server, and the Python `chuk_mcp` client talks to the Rust
@@ -76,9 +86,9 @@ from chuk_mcp_rs import StdioParameters, connect_to_server
 async def main():
     params = StdioParameters(command="python", args=["server.py"])
     async with await connect_to_server(params) as client:
-        tools = await client.list_tools()
+        tools = await client.list_tools()      # -> [Tool(name=...), ...]
         result = await client.call_tool("greet", {"name": "World"})
-        print(result["content"][0]["text"])
+        print(result.text)                     # typed result
 
 asyncio.run(main())
 ```

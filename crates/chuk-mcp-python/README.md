@@ -9,12 +9,17 @@ from chuk_mcp_rs import StdioParameters, connect_to_server
 async def main():
     params = StdioParameters(command="python", args=["server.py"])
     async with await connect_to_server(params) as client:
-        tools = await client.list_tools()
+        tools = await client.list_tools()          # [Tool(name=...), ...]
         result = await client.call_tool("greet", {"name": "World"})
-        print(result["content"][0]["text"])
+        print(result.text)                         # typed result object
 
 asyncio.run(main())
 ```
+
+Typed results (`tool.name`, `result.text`, `result.isError`,
+`resource.mimeType`, `caps.tools`), the low-level `stdio_client` / `send_*`
+API, the Streamable HTTP transport, `MCPServer` / `ProtocolHandler`, and an
+`McpError` hierarchy are all available.
 
 Build with [maturin](https://github.com/PyO3/maturin): `maturin develop` from
 `crates/chuk-mcp-python`.

@@ -1,12 +1,17 @@
 [package]
 name = "chuk-mcp"
-description = "Model Context Protocol client and server library (Rust port of chuk-mcp)"
+description = "Model Context Protocol (MCP) client and server library with stdio, Streamable HTTP, and SSE transports"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage = "https://github.com/chrishayuk/chuk-mcp-rs"
+documentation = "https://docs.rs/chuk-mcp"
+readme = "README.md"
+authors = ["Chris Hay <chrishayuk@googlemail.com>"]
+rust-version = "1.79"
 keywords = ["llm", "mcp", "client", "protocol"]
-categories = ["network-programming", "api-bindings"]
+categories = ["network-programming", "api-bindings", "asynchronous"]
 
 [dependencies]
 serde.workspace = true
