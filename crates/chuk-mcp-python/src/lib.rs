@@ -8,26 +8,49 @@ use std::sync::Arc;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::PyList;
 use pythonize::{depythonize, pythonize};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
 use chuk_mcp::client::McpClient as CoreClient;
+use chuk_mcp::protocol::types::info::ServerInfo;
 use chuk_mcp::server::McpServer as CoreServer;
 use chuk_mcp::transports::stdio::{StdioParameters as CoreStdioParameters, StdioTransport};
 
-pyo3::create_exception!(chuk_mcp_rs, McpError, pyo3::exceptions::PyException);
+mod streams;
+mod types;
+use types::{
+    PyGetPromptResult, PyPrompt, PyReadResourceResult, PyResource, PyServerInfo, PyTool,
+    PyToolResult,
+};
 
-fn to_py_err(e: chuk_mcp::McpError) -> PyErr {
-    McpError::new_err(e.to_string())
+// Exception hierarchy mirroring chuk_mcp: a base McpError with retryable /
+// non-retryable / version-mismatch / validation subclasses.
+pyo3::create_exception!(chuk_mcp_rs, McpError, pyo3::exceptions::PyException);
+pyo3::create_exception!(chuk_mcp_rs, RetryableError, McpError);
+pyo3::create_exception!(chuk_mcp_rs, NonRetryableError, McpError);
+pyo3::create_exception!(chuk_mcp_rs, VersionMismatchError, McpError);
+pyo3::create_exception!(chuk_mcp_rs, ValidationError, McpError);
+
+/// Map a core error to the matching Python exception subclass.
+pub(crate) fn to_py_err(e: chuk_mcp::McpError) -> PyErr {
+    use chuk_mcp::McpError as E;
+    let msg = e.to_string();
+    match e {
+        E::Retryable { .. } => RetryableError::new_err(msg),
+        E::NonRetryable { .. } => NonRetryableError::new_err(msg),
+        E::VersionMismatch { .. } => VersionMismatchError::new_err(msg),
+        E::Validation { .. } => ValidationError::new_err(msg),
+        _ => McpError::new_err(msg),
+    }
 }
 
-fn json_to_py(py: Python<'_>, value: &Value) -> PyResult<PyObject> {
+pub(crate) fn json_to_py(py: Python<'_>, value: &Value) -> PyResult<PyObject> {
     Ok(pythonize(py, value)?.unbind())
 }
 
-fn py_to_json(value: &Bound<'_, PyAny>) -> PyResult<Value> {
+pub(crate) fn py_to_json(value: &Bound<'_, PyAny>) -> PyResult<Value> {
     Ok(depythonize(value)?)
 }
 
@@ -66,11 +89,17 @@ impl PyStdioParameters {
     }
 }
 
+impl PyStdioParameters {
+    pub(crate) fn into_inner(self) -> CoreStdioParameters {
+        self.inner
+    }
+}
+
 /// High-level MCP client backed by the Rust core.
 #[pyclass(name = "MCPClient")]
 struct PyMcpClient {
     inner: Arc<Mutex<Option<CoreClient>>>,
-    server_info: Option<Value>,
+    server_info: Option<ServerInfo>,
     capabilities: Option<Value>,
 }
 
@@ -92,16 +121,13 @@ macro_rules! with_client {
 
 #[pymethods]
 impl PyMcpClient {
-    /// Server info from initialization, as a dict.
+    /// Server info from initialization (a ServerInfo, or None).
     #[getter]
-    fn server_info(&self, py: Python<'_>) -> PyResult<PyObject> {
-        match &self.server_info {
-            Some(info) => json_to_py(py, info),
-            None => Ok(py.None()),
-        }
+    fn server_info(&self) -> Option<PyServerInfo> {
+        self.server_info.clone().map(PyServerInfo::from)
     }
 
-    /// Server capabilities from initialization, as a dict.
+    /// Server capabilities from initialization, as a dict (or None).
     #[getter]
     fn capabilities(&self, py: Python<'_>) -> PyResult<PyObject> {
         match &self.capabilities {
@@ -110,17 +136,16 @@ impl PyMcpClient {
         }
     }
 
-    /// List available tools (list of dicts).
+    /// List available tools (list of Tool objects).
     fn list_tools<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.client();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let tools =
-                with_client!(client, client.list_tools().await).map_err(to_py_err)?;
-            Python::with_gil(|py| json_to_py(py, &serde_json::to_value(tools).unwrap()))
+            let tools = with_client!(client, client.list_tools().await).map_err(to_py_err)?;
+            Ok(tools.into_iter().map(PyTool::from).collect::<Vec<_>>())
         })
     }
 
-    /// Call a tool; returns the tool result as a dict.
+    /// Call a tool; returns a ToolResult.
     #[pyo3(signature = (name, arguments=None))]
     fn call_tool<'py>(
         &self,
@@ -136,41 +161,41 @@ impl PyMcpClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let result =
                 with_client!(client, client.call_tool(&name, args).await).map_err(to_py_err)?;
-            Python::with_gil(|py| json_to_py(py, &serde_json::to_value(result).unwrap()))
+            Ok(PyToolResult::from(result))
         })
     }
 
-    /// List available resources (list of dicts).
+    /// List available resources (list of Resource objects).
     fn list_resources<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.client();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let resources =
                 with_client!(client, client.list_resources().await).map_err(to_py_err)?;
-            Python::with_gil(|py| json_to_py(py, &serde_json::to_value(resources).unwrap()))
+            Ok(resources.into_iter().map(PyResource::from).collect::<Vec<_>>())
         })
     }
 
-    /// Read a resource by URI; returns the result as a dict.
+    /// Read a resource by URI; returns a ReadResourceResult.
     fn read_resource<'py>(&self, py: Python<'py>, uri: String) -> PyResult<Bound<'py, PyAny>> {
         let client = self.client();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let result =
                 with_client!(client, client.read_resource(&uri).await).map_err(to_py_err)?;
-            Python::with_gil(|py| json_to_py(py, &serde_json::to_value(result).unwrap()))
+            Ok(PyReadResourceResult::from(result))
         })
     }
 
-    /// List available prompts (list of dicts).
+    /// List available prompts (list of Prompt objects).
     fn list_prompts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.client();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let prompts =
                 with_client!(client, client.list_prompts().await).map_err(to_py_err)?;
-            Python::with_gil(|py| json_to_py(py, &serde_json::to_value(prompts).unwrap()))
+            Ok(prompts.into_iter().map(PyPrompt::from).collect::<Vec<_>>())
         })
     }
 
-    /// Get a prompt by name; returns the result as a dict.
+    /// Get a prompt by name; returns a GetPromptResult.
     #[pyo3(signature = (name, arguments=None))]
     fn get_prompt<'py>(
         &self,
@@ -186,7 +211,7 @@ impl PyMcpClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let result = with_client!(client, client.get_prompt(&name, args).await)
                 .map_err(to_py_err)?;
-            Python::with_gil(|py| json_to_py(py, &serde_json::to_value(result).unwrap()))
+            Ok(PyGetPromptResult::from(result))
         })
     }
 
@@ -242,10 +267,7 @@ fn connect_to_server<'py>(
         let mut client = CoreClient::new(transport);
         client.initialize().await.map_err(to_py_err)?;
 
-        let server_info = client
-            .server_info
-            .as_ref()
-            .map(|i| serde_json::to_value(i).unwrap());
+        let server_info = client.server_info.clone();
         let capabilities = client
             .capabilities
             .as_ref()
@@ -269,11 +291,20 @@ struct PyMcpServer {
 #[pymethods]
 impl PyMcpServer {
     #[new]
-    #[pyo3(signature = (name, version="1.0.0"))]
-    fn new(name: &str, version: &str) -> Self {
-        PyMcpServer {
-            inner: Arc::new(Mutex::new(Some(CoreServer::new(name, version, None)))),
-        }
+    #[pyo3(signature = (name, version="1.0.0", capabilities=None))]
+    fn new(name: &str, version: &str, capabilities: Option<Bound<'_, PyAny>>) -> PyResult<Self> {
+        let caps = match capabilities {
+            Some(c) => {
+                let value = py_to_json(&c)?;
+                Some(serde_json::from_value(value).map_err(|e| {
+                    PyRuntimeError::new_err(format!("invalid capabilities: {e}"))
+                })?)
+            }
+            None => None,
+        };
+        Ok(PyMcpServer {
+            inner: Arc::new(Mutex::new(Some(CoreServer::new(name, version, caps)))),
+        })
     }
 
     /// Register a tool. `handler` is an async callable taking keyword-friendly
@@ -395,17 +426,29 @@ fn core_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// A safe default environment for spawned stdio subprocesses.
+#[pyfunction]
+fn get_default_environment() -> HashMap<String, String> {
+    chuk_mcp::transports::stdio::get_default_environment()
+}
+
 #[pymodule]
 fn chuk_mcp_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyStdioParameters>()?;
     m.add_class::<PyMcpClient>()?;
     m.add_class::<PyMcpServer>()?;
+    types::register(m)?;
+    streams::register(m)?;
     m.add_function(wrap_pyfunction!(connect_to_server, m)?)?;
     m.add_function(wrap_pyfunction!(supported_versions, m)?)?;
     m.add_function(wrap_pyfunction!(core_version, m)?)?;
-    m.add("McpError", py.get_type::<McpError>())?;
-    m.add("CURRENT_VERSION", chuk_mcp::protocol::versioning::CURRENT_VERSION)?;
+    m.add_function(wrap_pyfunction!(get_default_environment, m)?)?;
 
-    let _ = PyDict::new(py); // keep PyDict import used on all feature paths
+    m.add("McpError", py.get_type::<McpError>())?;
+    m.add("RetryableError", py.get_type::<RetryableError>())?;
+    m.add("NonRetryableError", py.get_type::<NonRetryableError>())?;
+    m.add("VersionMismatchError", py.get_type::<VersionMismatchError>())?;
+    m.add("ValidationError", py.get_type::<ValidationError>())?;
+    m.add("CURRENT_VERSION", chuk_mcp::protocol::versioning::CURRENT_VERSION)?;
     Ok(())
 }

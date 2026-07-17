@@ -1,0 +1,274 @@
+//! Low-level functional API: opaque stream handles, a `stdio_client` async
+//! context manager, and the `send_*` free functions, mirroring the Python
+//! `chuk_mcp` message layer (`async with stdio_client(...) as (read, write)`).
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use pyo3::prelude::*;
+use serde_json::Value;
+use tokio::sync::Mutex;
+
+use chuk_mcp::protocol::messages::initialize::{
+    send_initialize_with_options, InitializeOptions,
+};
+use chuk_mcp::protocol::messages::ping::send_ping as core_send_ping;
+use chuk_mcp::protocol::messages::prompts::{
+    send_prompts_get as core_prompts_get, send_prompts_list as core_prompts_list,
+};
+use chuk_mcp::protocol::messages::resources::{
+    send_resources_list as core_resources_list, send_resources_read as core_resources_read,
+};
+use chuk_mcp::protocol::messages::send_message::{ReadStream, WriteStream};
+use chuk_mcp::protocol::messages::tools::{
+    send_tools_call as core_tools_call, send_tools_list as core_tools_list,
+};
+use chuk_mcp::transports::stdio::{StdioParameters as CoreStdioParameters, StdioTransport};
+use chuk_mcp::transports::Transport;
+
+use crate::types::{
+    PyGetPromptResult, PyInitializeResult, PyListPromptsResult, PyListResourcesResult,
+    PyListToolsResult, PyReadResourceResult, PyToolResult,
+};
+use crate::{py_to_json, to_py_err};
+
+/// Opaque handle to a transport's inbound message stream.
+#[pyclass(name = "ReadStream", frozen)]
+#[derive(Clone)]
+pub struct PyReadStream {
+    pub(crate) inner: ReadStream,
+}
+
+/// Opaque handle to a transport's outbound message stream.
+#[pyclass(name = "WriteStream", frozen)]
+#[derive(Clone)]
+pub struct PyWriteStream {
+    pub(crate) inner: WriteStream,
+}
+
+/// Async context manager wrapping a stdio transport, yielding `(read, write)`.
+#[pyclass(name = "StdioClient")]
+pub struct PyStdioClient {
+    params: CoreStdioParameters,
+    transport: Arc<Mutex<Option<StdioTransport>>>,
+}
+
+#[pymethods]
+impl PyStdioClient {
+    fn __aenter__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let params = self.params.clone();
+        let transport_slot = self.transport.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let transport = StdioTransport::start(params).await.map_err(to_py_err)?;
+            let (read, write) = transport.get_streams().await.map_err(to_py_err)?;
+            *transport_slot.lock().await = Some(transport);
+            Ok((PyReadStream { inner: read }, PyWriteStream { inner: write }))
+        })
+    }
+
+    #[pyo3(signature = (*_args))]
+    fn __aexit__<'py>(
+        &self,
+        py: Python<'py>,
+        _args: Bound<'py, pyo3::types::PyTuple>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let transport_slot = self.transport.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Some(mut transport) = transport_slot.lock().await.take() {
+                transport.close().await.map_err(to_py_err)?;
+            }
+            Ok(false) // don't suppress exceptions
+        })
+    }
+}
+
+/// Create a stdio client context manager: `async with stdio_client(params) as
+/// (read, write): ...`.
+#[pyfunction]
+pub fn stdio_client(parameters: crate::PyStdioParameters) -> PyStdioClient {
+    PyStdioClient {
+        params: parameters.into_inner(),
+        transport: Arc::new(Mutex::new(None)),
+    }
+}
+
+/// Perform the initialization handshake on a stream pair.
+#[pyfunction]
+#[pyo3(signature = (read, write, timeout=None, supported_versions=None, preferred_version=None))]
+pub fn send_initialize<'py>(
+    py: Python<'py>,
+    read: PyReadStream,
+    write: PyWriteStream,
+    timeout: Option<f64>,
+    supported_versions: Option<Vec<String>>,
+    preferred_version: Option<String>,
+) -> PyResult<Bound<'py, PyAny>> {
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let options = InitializeOptions {
+            timeout: timeout.map(Duration::from_secs_f64),
+            supported_versions,
+            preferred_version,
+            ..Default::default()
+        };
+        let result = send_initialize_with_options(&read.inner, &write.inner, options)
+            .await
+            .map_err(to_py_err)?;
+        Ok(PyInitializeResult::from(result))
+    })
+}
+
+/// List tools on a stream pair.
+#[pyfunction]
+#[pyo3(signature = (read, write, cursor=None, timeout=None))]
+pub fn send_tools_list<'py>(
+    py: Python<'py>,
+    read: PyReadStream,
+    write: PyWriteStream,
+    cursor: Option<String>,
+    timeout: Option<f64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let _ = timeout;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let result = core_tools_list(&read.inner, &write.inner, cursor.as_deref())
+            .await
+            .map_err(to_py_err)?;
+        Ok(PyListToolsResult::from(result))
+    })
+}
+
+/// Call a tool on a stream pair.
+#[pyfunction]
+#[pyo3(signature = (read, write, name, arguments=None, timeout=None))]
+pub fn send_tools_call<'py>(
+    py: Python<'py>,
+    read: PyReadStream,
+    write: PyWriteStream,
+    name: String,
+    arguments: Option<Bound<'py, PyAny>>,
+    timeout: Option<f64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let _ = timeout;
+    let args: Value = match arguments {
+        Some(args) => py_to_json(&args)?,
+        None => Value::Object(serde_json::Map::new()),
+    };
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let result = core_tools_call(&read.inner, &write.inner, &name, args)
+            .await
+            .map_err(to_py_err)?;
+        Ok(PyToolResult::from(result))
+    })
+}
+
+/// List resources on a stream pair.
+#[pyfunction]
+#[pyo3(signature = (read, write, cursor=None, timeout=None))]
+pub fn send_resources_list<'py>(
+    py: Python<'py>,
+    read: PyReadStream,
+    write: PyWriteStream,
+    cursor: Option<String>,
+    timeout: Option<f64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let _ = timeout;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let result = core_resources_list(&read.inner, &write.inner, cursor.as_deref())
+            .await
+            .map_err(to_py_err)?;
+        Ok(PyListResourcesResult::from(result))
+    })
+}
+
+/// Read a resource on a stream pair.
+#[pyfunction]
+#[pyo3(signature = (read, write, uri, timeout=None))]
+pub fn send_resources_read<'py>(
+    py: Python<'py>,
+    read: PyReadStream,
+    write: PyWriteStream,
+    uri: String,
+    timeout: Option<f64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let _ = timeout;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let result = core_resources_read(&read.inner, &write.inner, &uri)
+            .await
+            .map_err(to_py_err)?;
+        Ok(PyReadResourceResult::from(result))
+    })
+}
+
+/// List prompts on a stream pair.
+#[pyfunction]
+#[pyo3(signature = (read, write, cursor=None, timeout=None))]
+pub fn send_prompts_list<'py>(
+    py: Python<'py>,
+    read: PyReadStream,
+    write: PyWriteStream,
+    cursor: Option<String>,
+    timeout: Option<f64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let _ = timeout;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let result = core_prompts_list(&read.inner, &write.inner, cursor.as_deref())
+            .await
+            .map_err(to_py_err)?;
+        Ok(PyListPromptsResult::from(result))
+    })
+}
+
+/// Get a prompt on a stream pair.
+#[pyfunction]
+#[pyo3(signature = (read, write, name, arguments=None, timeout=None))]
+pub fn send_prompts_get<'py>(
+    py: Python<'py>,
+    read: PyReadStream,
+    write: PyWriteStream,
+    name: String,
+    arguments: Option<Bound<'py, PyAny>>,
+    timeout: Option<f64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let _ = timeout;
+    let args: Option<Value> = match arguments {
+        Some(args) => Some(py_to_json(&args)?),
+        None => None,
+    };
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let result = core_prompts_get(&read.inner, &write.inner, &name, args)
+            .await
+            .map_err(to_py_err)?;
+        Ok(PyGetPromptResult::from(result))
+    })
+}
+
+/// Ping on a stream pair; resolves to True/False.
+#[pyfunction]
+#[pyo3(signature = (read, write, timeout=None))]
+pub fn send_ping<'py>(
+    py: Python<'py>,
+    read: PyReadStream,
+    write: PyWriteStream,
+    timeout: Option<f64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let _ = timeout;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        Ok(core_send_ping(&read.inner, &write.inner).await)
+    })
+}
+
+/// Register the low-level stream API on the module.
+pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyReadStream>()?;
+    m.add_class::<PyWriteStream>()?;
+    m.add_class::<PyStdioClient>()?;
+    m.add_function(wrap_pyfunction!(stdio_client, m)?)?;
+    m.add_function(wrap_pyfunction!(send_initialize, m)?)?;
+    m.add_function(wrap_pyfunction!(send_tools_list, m)?)?;
+    m.add_function(wrap_pyfunction!(send_tools_call, m)?)?;
+    m.add_function(wrap_pyfunction!(send_resources_list, m)?)?;
+    m.add_function(wrap_pyfunction!(send_resources_read, m)?)?;
+    m.add_function(wrap_pyfunction!(send_prompts_list, m)?)?;
+    m.add_function(wrap_pyfunction!(send_prompts_get, m)?)?;
+    m.add_function(wrap_pyfunction!(send_ping, m)?)?;
+    Ok(())
+}
