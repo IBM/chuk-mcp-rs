@@ -79,7 +79,10 @@ jobs:
     name: Publish chuk-mcp-rs to PyPI
     needs: [wheels, sdist]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+    # PyPI publishing is opt-in only (manual workflow_dispatch with publish=true).
+    # A version tag publishes the Rust crate and builds wheels, but does not
+    # push the Python bindings to PyPI.
+    if: inputs.publish
     # Trusted publishing (OIDC). Configure a PyPI trusted publisher for this
     # repo/workflow, or set MATURIN_PYPI_TOKEN and switch to a token upload.
     permissions:
