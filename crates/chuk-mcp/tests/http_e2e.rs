@@ -135,6 +135,10 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[tokio::test]
 async fn streamable_http_roundtrip() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_test_writer()
+        .try_init();
     let url = spawn_server().await;
 
     let params = StreamableHttpParameters::new(url).unwrap();

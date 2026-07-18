@@ -26,3 +26,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+async-trait.workspace = true
+tracing-subscriber = "0.3"

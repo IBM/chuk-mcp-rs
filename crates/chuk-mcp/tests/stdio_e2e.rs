@@ -14,6 +14,10 @@ fn demo_server_params() -> StdioParameters {
 
 #[tokio::test]
 async fn full_client_server_roundtrip() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_test_writer()
+        .try_init();
     let mut client = connect_to_server(demo_server_params())
         .await
         .expect("connect + initialize");

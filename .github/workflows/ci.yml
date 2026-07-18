@@ -42,6 +42,25 @@ jobs:
         env:
           PYO3_PYTHON: python3
 
+  coverage:
+    name: Coverage (core crate, >=90%)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      - name: Coverage gate
+        # The demo-server binary is a subprocess fixture llvm-cov can't observe;
+        # every other source file is kept at >=90% line coverage.
+        run: >
+          cargo llvm-cov --package chuk-mcp
+          --ignore-filename-regex 'bin/'
+          --fail-under-lines 90
+          --summary-only
+
   wheels:
     name: Wheels (${{ matrix.platform.os }})
     needs: test

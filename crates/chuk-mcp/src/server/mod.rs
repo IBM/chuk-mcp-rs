@@ -253,11 +253,25 @@ impl McpServer {
     /// Serve over stdio: newline-delimited JSON-RPC on stdin/stdout, until
     /// stdin closes. This is how a subprocess-based MCP server runs.
     pub async fn run_stdio(&self) -> Result<(), crate::protocol::types::errors::McpError> {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let reader = tokio::io::BufReader::new(tokio::io::stdin());
+        self.serve(reader, tokio::io::stdout()).await
+    }
 
-        let stdin = tokio::io::stdin();
-        let mut stdout = tokio::io::stdout();
-        let mut lines = BufReader::new(stdin).lines();
+    /// Serve newline-delimited JSON-RPC over the given reader/writer until the
+    /// reader reaches EOF. [`run_stdio`](Self::run_stdio) is this with
+    /// stdin/stdout.
+    pub async fn serve<R, W>(
+        &self,
+        reader: R,
+        mut writer: W,
+    ) -> Result<(), crate::protocol::types::errors::McpError>
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let mut lines = reader.lines();
         let mut session_id: Option<String> = None;
 
         while let Some(line) = lines.next_line().await? {
@@ -280,8 +294,8 @@ impl McpServer {
             if let Some(response) = response {
                 let mut json = response.to_json();
                 json.push('\n');
-                stdout.write_all(json.as_bytes()).await?;
-                stdout.flush().await?;
+                writer.write_all(json.as_bytes()).await?;
+                writer.flush().await?;
             }
         }
         Ok(())
