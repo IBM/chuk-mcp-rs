@@ -209,15 +209,37 @@ async fn handle_sse_connection(
         }
     };
 
+    process_sse_lines(
+        response.bytes_stream(),
+        &params,
+        &shared,
+        &incoming_tx,
+        max_buffer_size,
+    )
+    .await;
+    tracing::debug!("SSE stream ended");
+}
+
+/// Core SSE line loop, generic over the byte stream so tests can drive it
+/// with hand-built chunks.
+async fn process_sse_lines<S, B, E>(
+    mut stream: S,
+    params: &SseParameters,
+    shared: &SseShared,
+    incoming_tx: &mpsc::Sender<JsonRpcMessage>,
+    max_buffer_size: usize,
+) where
+    S: futures::Stream<Item = Result<B, E>> + Unpin,
+    B: AsRef<[u8]>,
+{
     // Buffer bytes rather than text: a multi-byte character split across
     // chunks must not be decoded until its line is complete.
     let mut buffer: Vec<u8> = Vec::new();
-    let mut stream = response.bytes_stream();
     let mut current_event: Option<String> = None;
 
     while let Some(chunk) = stream.next().await {
         let Ok(chunk) = chunk else { break };
-        buffer.extend_from_slice(&chunk);
+        buffer.extend_from_slice(chunk.as_ref());
 
         while let Some(newline) = buffer.iter().position(|&b| b == b'\n') {
             let line_bytes: Vec<u8> = buffer.drain(..=newline).collect();
@@ -234,16 +256,16 @@ async fn handle_sse_connection(
             } else if let Some(rest) = line.strip_prefix("data:") {
                 let data = rest.trim();
                 match current_event.as_deref() {
-                    Some("endpoint") => handle_endpoint_event(data, &params, &shared),
-                    Some("message") => route_message_data(data, &incoming_tx).await,
+                    Some("endpoint") => handle_endpoint_event(data, params, shared),
+                    Some("message") => route_message_data(data, incoming_tx).await,
                     Some("keepalive") => tracing::debug!("Received keepalive"),
                     _ => {
                         // Untyped data: endpoint announcement or JSON-RPC.
                         let no_url = shared.message_url.lock().expect("url lock").is_none();
                         if no_url && (data.contains("/messages/") || data.contains("/mcp")) {
-                            handle_endpoint_event(data, &params, &shared);
+                            handle_endpoint_event(data, params, shared);
                         } else if data.starts_with('{') && data.contains("\"jsonrpc\"") {
-                            route_message_data(data, &incoming_tx).await;
+                            route_message_data(data, incoming_tx).await;
                         } else {
                             tracing::debug!("Unknown SSE data: {:.100}", data);
                         }
@@ -264,7 +286,6 @@ async fn handle_sse_connection(
             return;
         }
     }
-    tracing::debug!("SSE stream ended");
 }
 
 /// Handle the `endpoint` event announcing where to POST messages.
@@ -429,5 +450,33 @@ mod tests {
             Some("http://localhost:3000/messages/?session_id=abc123")
         );
         assert_eq!(shared.session_id.lock().unwrap().as_deref(), Some("abc123"));
+    }
+
+    #[tokio::test]
+    async fn sse_lines_processed_before_cap_abort() {
+        let params = SseParameters::new("http://localhost:3000").unwrap();
+        let shared = SseShared::default();
+        let (tx, _rx) = mpsc::channel(10);
+
+        // One complete endpoint event, then an endless run with no newline.
+        // If the loop failed to abort, the stream would never end and the
+        // timeout would trip.
+        let mut first = b"event: endpoint\ndata: /messages/?session_id=abc\n\n".to_vec();
+        first.extend_from_slice(&[b'A'; 2000]);
+        let stream = futures::stream::iter([Ok::<_, ()>(first)])
+            .chain(futures::stream::repeat_with(|| Ok(vec![b'A'; 1000])));
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            process_sse_lines(stream, &params, &shared, &tx, 1000),
+        )
+        .await
+        .expect("loop must abort once the undelimited remainder exceeds the cap");
+
+        // The complete lines ahead of the oversized tail were still handled.
+        assert_eq!(
+            shared.message_url.lock().unwrap().as_deref(),
+            Some("http://localhost:3000/messages/?session_id=abc")
+        );
     }
 }

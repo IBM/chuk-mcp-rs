@@ -298,15 +298,27 @@ async fn stream_sse_response(
     incoming_tx: &mpsc::Sender<JsonRpcMessage>,
     max_buffer_size: usize,
 ) {
+    process_sse_stream(response.bytes_stream(), incoming_tx, max_buffer_size).await;
+}
+
+/// Core SSE event loop, generic over the byte stream so tests can drive it
+/// with hand-built chunks.
+async fn process_sse_stream<S, B, E>(
+    mut stream: S,
+    incoming_tx: &mpsc::Sender<JsonRpcMessage>,
+    max_buffer_size: usize,
+) where
+    S: futures::Stream<Item = Result<B, E>> + Unpin,
+    B: AsRef<[u8]>,
+{
     use futures::StreamExt;
 
     // Buffer bytes rather than text: a multi-byte character split across
     // chunks must not be decoded until its event is complete.
     let mut buffer: Vec<u8> = Vec::new();
-    let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let Ok(chunk) = chunk else { break };
-        buffer.extend_from_slice(&chunk);
+        buffer.extend_from_slice(chunk.as_ref());
 
         // Process complete events (separated by blank lines).
         while let Some(pos) = find_event_boundary(&buffer) {
@@ -443,5 +455,76 @@ mod tests {
     fn event_boundary() {
         assert_eq!(find_event_boundary(b"data: x\n\nrest"), Some(9));
         assert_eq!(find_event_boundary(b"data: x"), None);
+    }
+
+    const EVENT: &[u8] = b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n";
+
+    #[tokio::test]
+    async fn sse_stream_routes_complete_events_before_cap_abort() {
+        use futures::StreamExt;
+
+        let (tx, mut rx) = mpsc::channel(10);
+
+        // One complete event, then an endless run with no event boundary. If
+        // the loop failed to abort, the stream would never end and the
+        // timeout would trip.
+        let mut first = EVENT.to_vec();
+        first.extend_from_slice(&[b'A'; 2000]);
+        let stream = futures::stream::iter([Ok::<_, ()>(first)])
+            .chain(futures::stream::repeat_with(|| Ok(vec![b'A'; 1000])));
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            process_sse_stream(stream, &tx, 1000),
+        )
+        .await
+        .expect("loop must abort once the undelimited remainder exceeds the cap");
+
+        // The complete event ahead of the oversized tail was still routed.
+        assert!(matches!(rx.try_recv(), Ok(JsonRpcMessage::Response(_))));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn sse_stream_cap_ignores_completed_events() {
+        let (tx, mut rx) = mpsc::channel(10);
+
+        // Three complete events in one chunk, together far larger than the
+        // cap: only the undelimited remainder counts, so nothing aborts.
+        let chunk = EVENT.repeat(3);
+        let cap = EVENT.len() + 1;
+        assert!(chunk.len() > cap);
+
+        process_sse_stream(futures::stream::iter([Ok::<_, ()>(chunk)]), &tx, cap).await;
+
+        for _ in 0..3 {
+            assert!(matches!(rx.try_recv(), Ok(JsonRpcMessage::Response(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_stream_reassembles_split_multibyte_chars() {
+        let (tx, mut rx) = mpsc::channel(10);
+
+        let event =
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"v\":\"\u{1f389}\"}}\n\n".as_bytes();
+        // Split mid-character: each half alone is invalid UTF-8, so decoding
+        // per chunk would mangle the character to U+FFFD.
+        let mid = event
+            .windows(4)
+            .position(|w| w == "\u{1f389}".as_bytes())
+            .unwrap()
+            + 2;
+        let stream = futures::stream::iter([
+            Ok::<_, ()>(event[..mid].to_vec()),
+            Ok(event[mid..].to_vec()),
+        ]);
+
+        process_sse_stream(stream, &tx, 1000).await;
+
+        let Ok(JsonRpcMessage::Response(resp)) = rx.try_recv() else {
+            panic!("expected a routed response");
+        };
+        assert!(serde_json::to_string(&resp).unwrap().contains('\u{1f389}'));
     }
 }
