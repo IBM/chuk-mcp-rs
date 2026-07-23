@@ -10,6 +10,9 @@ use tokio::sync::{mpsc, Semaphore};
 use crate::protocol::json_rpc::{parse_message_str, JsonRpcMessage};
 use crate::protocol::messages::send_message::{message_channel, ReadStream, WriteStream};
 use crate::protocol::types::errors::{McpError, INTERNAL_ERROR, PARSE_ERROR};
+use crate::transports::limits::{
+    exceeds_limit, read_body_bounded, too_large_error, TransportLimits,
+};
 use crate::transports::Transport;
 
 /// Parameters for Streamable HTTP transport.
@@ -101,6 +104,14 @@ pub struct StreamableHttpTransport {
 impl StreamableHttpTransport {
     /// Start the transport and its outgoing message handler.
     pub fn start(parameters: StreamableHttpParameters) -> Result<Self, McpError> {
+        Self::start_with_limits(parameters, TransportLimits::default())
+    }
+
+    /// Start the transport with explicit buffer limits.
+    pub fn start_with_limits(
+        parameters: StreamableHttpParameters,
+        limits: TransportLimits,
+    ) -> Result<Self, McpError> {
         let (incoming_tx, incoming) = message_channel(100);
         let (outgoing, mut outgoing_rx) = mpsc::channel::<JsonRpcMessage>(100);
 
@@ -113,6 +124,7 @@ impl StreamableHttpTransport {
             .map_err(|e| McpError::Transport(format!("Failed to build HTTP client: {e}")))?;
 
         let semaphore = Arc::new(Semaphore::new(parameters.max_concurrent_requests.max(1)));
+        let max_buffer_size = limits.max_buffer_size;
 
         let task = tokio::spawn(async move {
             while let Some(message) = outgoing_rx.recv().await {
@@ -123,7 +135,15 @@ impl StreamableHttpTransport {
                 let session = session_for_task.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    send_via_http(&client, &params, &session, &incoming_tx, message).await;
+                    send_via_http(
+                        &client,
+                        &params,
+                        &session,
+                        &incoming_tx,
+                        message,
+                        max_buffer_size,
+                    )
+                    .await;
                 });
             }
         });
@@ -149,6 +169,7 @@ async fn send_via_http(
     session: &Arc<std::sync::Mutex<Option<String>>>,
     incoming_tx: &mpsc::Sender<JsonRpcMessage>,
     message: JsonRpcMessage,
+    max_buffer_size: usize,
 ) {
     let message_id = message.id().cloned();
     let method = message.method().unwrap_or("unknown").to_string();
@@ -195,7 +216,9 @@ async fn send_via_http(
         .to_string();
 
     if status.as_u16() >= 400 {
-        let text = response.text().await.unwrap_or_default();
+        let text = read_body_bounded(response, max_buffer_size, "HTTP response")
+            .await
+            .unwrap_or_default();
         route_error(
             incoming_tx,
             &message_id,
@@ -207,11 +230,17 @@ async fn send_via_http(
     }
 
     if content_type.contains("text/event-stream") {
-        stream_sse_response(response, incoming_tx).await;
+        stream_sse_response(response, incoming_tx, max_buffer_size).await;
         return;
     }
 
-    let text = response.text().await.unwrap_or_default();
+    let text = match read_body_bounded(response, max_buffer_size, "HTTP response").await {
+        Ok(text) => text,
+        Err(e) => {
+            route_error(incoming_tx, &message_id, INTERNAL_ERROR, &e.to_string()).await;
+            return;
+        }
+    };
     if text.is_empty() {
         // Empty body (e.g. 202 Accepted). Fine for notifications; synthesize
         // an empty success for requests so callers don't hang.
@@ -267,6 +296,7 @@ async fn route_error(
 async fn stream_sse_response(
     response: reqwest::Response,
     incoming_tx: &mpsc::Sender<JsonRpcMessage>,
+    max_buffer_size: usize,
 ) {
     use futures::StreamExt;
 
@@ -275,6 +305,16 @@ async fn stream_sse_response(
     while let Some(chunk) = stream.next().await {
         let Ok(chunk) = chunk else { break };
         buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+        // A server that never completes an event would otherwise grow this
+        // buffer without bound - abort instead of exhausting memory.
+        if exceeds_limit(buffer.len(), max_buffer_size) {
+            tracing::error!(
+                "{}",
+                too_large_error(buffer.len(), max_buffer_size, "SSE event")
+            );
+            return;
+        }
 
         // Process complete events (separated by blank lines).
         while let Some(pos) = find_event_boundary(&buffer) {

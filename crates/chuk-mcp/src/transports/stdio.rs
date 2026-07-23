@@ -6,7 +6,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, Mutex};
 
@@ -14,6 +14,7 @@ use crate::protocol::features::batching::BatchProcessor;
 use crate::protocol::json_rpc::parse_message_str;
 use crate::protocol::messages::send_message::{message_channel, ReadStream, WriteStream};
 use crate::protocol::types::errors::McpError;
+use crate::transports::limits::{read_line_bounded, TransportLimits};
 use crate::transports::Transport;
 
 /// Environment variables inherited by default (non-Windows), matching
@@ -88,6 +89,14 @@ pub struct StdioTransport {
 impl StdioTransport {
     /// Spawn the server subprocess and start the reader/writer tasks.
     pub async fn start(parameters: StdioParameters) -> Result<Self, McpError> {
+        Self::start_with_limits(parameters, TransportLimits::default()).await
+    }
+
+    /// Spawn the server subprocess with explicit buffer limits.
+    pub async fn start_with_limits(
+        parameters: StdioParameters,
+        limits: TransportLimits,
+    ) -> Result<Self, McpError> {
         if parameters.command.is_empty() {
             return Err(McpError::validation("Server command must not be empty."));
         }
@@ -151,10 +160,13 @@ impl StdioTransport {
 
         // stdout reader: parse newline-delimited JSON-RPC and route inbound.
         let reader_bp = batch_processor.clone();
+        let max_buffer_size = limits.max_buffer_size;
         let reader = tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
+            let mut stdout = BufReader::new(stdout);
             loop {
-                match lines.next_line().await {
+                // Bounded read: a server process that never terminates a line
+                // would otherwise grow this buffer until memory runs out.
+                match read_line_bounded(&mut stdout, max_buffer_size, "stdio message").await {
                     Ok(Some(line)) => {
                         let line = line.trim();
                         if line.is_empty() {

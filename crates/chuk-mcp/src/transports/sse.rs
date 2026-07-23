@@ -15,6 +15,9 @@ use tokio::sync::{mpsc, Notify};
 use crate::protocol::json_rpc::{parse_message_str, JsonRpcMessage};
 use crate::protocol::messages::send_message::{message_channel, ReadStream, WriteStream};
 use crate::protocol::types::errors::{McpError, INTERNAL_ERROR};
+use crate::transports::limits::{
+    exceeds_limit, read_body_bounded, too_large_error, TransportLimits,
+};
 use crate::transports::Transport;
 
 /// Parameters for the (deprecated) SSE transport.
@@ -90,6 +93,14 @@ impl SseTransport {
     /// Connect to the SSE endpoint and start the reader and sender tasks.
     /// Waits (up to the configured timeout) for the server's `endpoint` event.
     pub async fn start(parameters: SseParameters) -> Result<Self, McpError> {
+        Self::start_with_limits(parameters, TransportLimits::default()).await
+    }
+
+    /// Connect with explicit buffer limits.
+    pub async fn start_with_limits(
+        parameters: SseParameters,
+        limits: TransportLimits,
+    ) -> Result<Self, McpError> {
         let (incoming_tx, incoming) = message_channel(100);
         let (outgoing, outgoing_rx) = mpsc::channel::<JsonRpcMessage>(100);
 
@@ -114,6 +125,7 @@ impl SseTransport {
             parameters.clone(),
             shared.clone(),
             incoming_tx.clone(),
+            limits.max_buffer_size,
         ));
 
         let sender_task = tokio::spawn(outgoing_handler(
@@ -122,6 +134,7 @@ impl SseTransport {
             shared.clone(),
             outgoing_rx,
             incoming_tx,
+            limits.max_buffer_size,
         ));
 
         let transport = SseTransport {
@@ -171,6 +184,7 @@ async fn handle_sse_connection(
     params: SseParameters,
     shared: Arc<SseShared>,
     incoming_tx: mpsc::Sender<JsonRpcMessage>,
+    max_buffer_size: usize,
 ) {
     let sse_url = format!("{}{}", params.url, params.sse_endpoint);
     tracing::info!("Connecting to SSE endpoint: {sse_url}");
@@ -202,6 +216,16 @@ async fn handle_sse_connection(
     while let Some(chunk) = stream.next().await {
         let Ok(chunk) = chunk else { break };
         buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+        // A server that never sends a newline would otherwise grow this
+        // buffer without bound - abort instead of exhausting memory.
+        if exceeds_limit(buffer.len(), max_buffer_size) {
+            tracing::error!(
+                "{}",
+                too_large_error(buffer.len(), max_buffer_size, "SSE event")
+            );
+            return;
+        }
 
         while let Some(newline) = buffer.find('\n') {
             let line: String = buffer.drain(..=newline).collect();
@@ -283,6 +307,7 @@ async fn outgoing_handler(
     shared: Arc<SseShared>,
     mut outgoing_rx: mpsc::Receiver<JsonRpcMessage>,
     incoming_tx: mpsc::Sender<JsonRpcMessage>,
+    max_buffer_size: usize,
 ) {
     while let Some(message) = outgoing_rx.recv().await {
         let Some(message_url) = shared.message_url.lock().expect("url lock").clone() else {
@@ -303,17 +328,21 @@ async fn outgoing_handler(
                 let status = response.status().as_u16();
                 if status == 200 {
                     // Immediate HTTP response: route the body.
-                    if let Ok(text) = response.text().await {
-                        if !text.is_empty() {
+                    match read_body_bounded(response, max_buffer_size, "HTTP response").await {
+                        Ok(text) if !text.is_empty() => {
                             route_message_data(&text, &incoming_tx).await;
                         }
+                        Ok(_) => {}
+                        Err(e) => tracing::error!("Failed to read response body: {e}"),
                     }
                 } else if status == 202 {
                     // Async: the response arrives via the SSE stream and is
                     // routed by the reader task.
                     tracing::debug!("Message {message_id:?} accepted, awaiting SSE response");
                 } else {
-                    let text = response.text().await.unwrap_or_default();
+                    let text = read_body_bounded(response, max_buffer_size, "HTTP response")
+                        .await
+                        .unwrap_or_default();
                     // Try to parse the body anyway; otherwise synthesize error.
                     if parse_message_str(&text).is_ok() {
                         route_message_data(&text, &incoming_tx).await;
