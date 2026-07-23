@@ -209,26 +209,19 @@ async fn handle_sse_connection(
         }
     };
 
-    let mut buffer = String::new();
+    // Buffer bytes rather than text: a multi-byte character split across
+    // chunks must not be decoded until its line is complete.
+    let mut buffer: Vec<u8> = Vec::new();
     let mut stream = response.bytes_stream();
     let mut current_event: Option<String> = None;
 
     while let Some(chunk) = stream.next().await {
         let Ok(chunk) = chunk else { break };
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        buffer.extend_from_slice(&chunk);
 
-        // A server that never sends a newline would otherwise grow this
-        // buffer without bound - abort instead of exhausting memory.
-        if exceeds_limit(buffer.len(), max_buffer_size) {
-            tracing::error!(
-                "{}",
-                too_large_error(buffer.len(), max_buffer_size, "SSE event")
-            );
-            return;
-        }
-
-        while let Some(newline) = buffer.find('\n') {
-            let line: String = buffer.drain(..=newline).collect();
+        while let Some(newline) = buffer.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = buffer.drain(..=newline).collect();
+            let line = String::from_utf8_lossy(&line_bytes);
             let line = line.trim_end_matches(['\n', '\r']);
 
             if line.is_empty() {
@@ -257,6 +250,18 @@ async fn handle_sse_connection(
                     }
                 }
             }
+        }
+
+        // A server that never sends a newline would otherwise grow this
+        // buffer without bound - abort instead of exhausting memory.
+        // Checked after the complete lines above are processed, so only
+        // the undelimited remainder counts toward the cap.
+        if exceeds_limit(buffer.len(), max_buffer_size) {
+            tracing::error!(
+                "{}",
+                too_large_error(buffer.len(), max_buffer_size, "SSE event")
+            );
+            return;
         }
     }
     tracing::debug!("SSE stream ended");

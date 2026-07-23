@@ -300,14 +300,24 @@ async fn stream_sse_response(
 ) {
     use futures::StreamExt;
 
-    let mut buffer = String::new();
+    // Buffer bytes rather than text: a multi-byte character split across
+    // chunks must not be decoded until its event is complete.
+    let mut buffer: Vec<u8> = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let Ok(chunk) = chunk else { break };
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        buffer.extend_from_slice(&chunk);
+
+        // Process complete events (separated by blank lines).
+        while let Some(pos) = find_event_boundary(&buffer) {
+            let event_bytes: Vec<u8> = buffer.drain(..pos).collect();
+            process_sse_event_text(&String::from_utf8_lossy(&event_bytes), incoming_tx).await;
+        }
 
         // A server that never completes an event would otherwise grow this
         // buffer without bound - abort instead of exhausting memory.
+        // Checked after the complete events above are processed, so only
+        // the undelimited remainder counts toward the cap.
         if exceeds_limit(buffer.len(), max_buffer_size) {
             tracing::error!(
                 "{}",
@@ -315,24 +325,22 @@ async fn stream_sse_response(
             );
             return;
         }
-
-        // Process complete events (separated by blank lines).
-        while let Some(pos) = find_event_boundary(&buffer) {
-            let event_text: String = buffer.drain(..pos).collect();
-            process_sse_event_text(&event_text, incoming_tx).await;
-        }
     }
     // Trailing event without final blank line.
-    if !buffer.trim().is_empty() {
-        process_sse_event_text(&buffer, incoming_tx).await;
+    let trailing = String::from_utf8_lossy(&buffer);
+    if !trailing.trim().is_empty() {
+        process_sse_event_text(&trailing, incoming_tx).await;
     }
 }
 
 /// Find the end of the first complete SSE event (blank-line separator),
 /// returning the index just past the separator.
-fn find_event_boundary(buffer: &str) -> Option<usize> {
-    let lf = buffer.find("\n\n").map(|i| i + 2);
-    let crlf = buffer.find("\r\n\r\n").map(|i| i + 4);
+fn find_event_boundary(buffer: &[u8]) -> Option<usize> {
+    let lf = buffer.windows(2).position(|w| w == b"\n\n").map(|i| i + 2);
+    let crlf = buffer
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4);
     match (lf, crlf) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
@@ -433,7 +441,7 @@ mod tests {
 
     #[test]
     fn event_boundary() {
-        assert_eq!(find_event_boundary("data: x\n\nrest"), Some(9));
-        assert_eq!(find_event_boundary("data: x"), None);
+        assert_eq!(find_event_boundary(b"data: x\n\nrest"), Some(9));
+        assert_eq!(find_event_boundary(b"data: x"), None);
     }
 }

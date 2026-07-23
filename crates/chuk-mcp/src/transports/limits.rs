@@ -75,6 +75,10 @@ pub fn too_large_error(len: usize, max_size: usize, context: &str) -> McpError {
 /// Returns `Ok(None)` at EOF. Unlike [`AsyncBufReadExt::read_line`], the
 /// accumulated line is bounded, so a peer that never sends a newline cannot
 /// grow the buffer without limit. The trailing newline is not included.
+///
+/// The check runs once per buffered read, so a line may overshoot `max_size`
+/// by up to one internal buffer (8 KB for a default `BufReader`) before
+/// being rejected.
 pub async fn read_line_bounded<R>(
     reader: &mut R,
     max_size: usize,
@@ -126,6 +130,9 @@ where
 ///
 /// `reqwest`'s own [`reqwest::Response::text`] applies no size limit, so the
 /// body must be consumed chunk-by-chunk to enforce one.
+///
+/// Unlike `text()`, the body is decoded as UTF-8 (lossily) and the response's
+/// charset header is ignored - MCP payloads are UTF-8 JSON.
 pub async fn read_body_bounded(
     mut response: reqwest::Response,
     max_size: usize,
