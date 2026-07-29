@@ -20,11 +20,11 @@ use chuk_mcp::protocol::types::capabilities::ServerCapabilities as CoreServerCap
 use chuk_mcp::protocol::types::info::ServerInfo;
 use serde_json::Map;
 
-fn json_to_py(py: Python<'_>, value: &Value) -> PyResult<PyObject> {
+fn json_to_py(py: Python<'_>, value: &Value) -> PyResult<Py<PyAny>> {
     Ok(pythonize(py, value)?.unbind())
 }
 
-fn to_dict<T: Serialize>(py: Python<'_>, value: &T) -> PyResult<PyObject> {
+fn to_dict<T: Serialize>(py: Python<'_>, value: &T) -> PyResult<Py<PyAny>> {
     let json = serde_json::to_value(value)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("serialize error: {e}")))?;
     json_to_py(py, &json)
@@ -35,7 +35,7 @@ fn to_dict<T: Serialize>(py: Python<'_>, value: &T) -> PyResult<PyObject> {
 /// Present sections are always truthy (matching the Pydantic models, where an
 /// empty `ToolsCapability()` object is still truthy), and expose their fields
 /// both by attribute (`caps.tools.listChanged`) and item (`caps.tools["listChanged"]`).
-#[pyclass(name = "CapabilitySection", frozen)]
+#[pyclass(name = "CapabilitySection", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyCapabilitySection {
     data: Map<String, Value>,
@@ -47,7 +47,7 @@ impl PyCapabilitySection {
         true
     }
 
-    fn __getattr__(&self, py: Python<'_>, name: &str) -> PyResult<PyObject> {
+    fn __getattr__(&self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
         // Don't intercept dunder lookups.
         if name.starts_with("__") && name.ends_with("__") {
             return Err(pyo3::exceptions::PyAttributeError::new_err(
@@ -60,7 +60,7 @@ impl PyCapabilitySection {
         }
     }
 
-    fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<PyObject> {
+    fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
         match self.data.get(key) {
             Some(v) => json_to_py(py, v),
             None => Err(pyo3::exceptions::PyKeyError::new_err(key.to_string())),
@@ -68,14 +68,14 @@ impl PyCapabilitySection {
     }
 
     #[pyo3(signature = (key, default=None))]
-    fn get(&self, py: Python<'_>, key: &str, default: Option<PyObject>) -> PyResult<PyObject> {
+    fn get(&self, py: Python<'_>, key: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
         match self.data.get(key) {
             Some(v) => json_to_py(py, v),
             None => Ok(default.unwrap_or_else(|| py.None())),
         }
     }
 
-    fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         json_to_py(py, &Value::Object(self.data.clone()))
     }
 
@@ -99,7 +99,7 @@ fn to_section<T: Serialize>(opt: &Option<T>) -> Option<PyCapabilitySection> {
 
 /// Capabilities a server supports. Sections are `None` when absent and a
 /// (truthy) [`PyCapabilitySection`] when present.
-#[pyclass(name = "ServerCapabilities", frozen)]
+#[pyclass(name = "ServerCapabilities", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyServerCapabilities {
     pub(crate) inner: CoreServerCapabilities,
@@ -128,13 +128,13 @@ impl PyServerCapabilities {
         to_section(&self.inner.completion)
     }
     #[getter]
-    fn experimental(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn experimental(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         match &self.inner.experimental {
             Some(m) => to_dict(py, m),
             None => Ok(py.None()),
         }
     }
-    fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         to_dict(py, &self.inner)
     }
     fn __repr__(&self) -> String {
@@ -165,7 +165,7 @@ impl From<CoreServerCapabilities> for PyServerCapabilities {
 }
 
 /// Information about the server implementation.
-#[pyclass(name = "ServerInfo", frozen)]
+#[pyclass(name = "ServerInfo", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyServerInfo {
     pub(crate) inner: ServerInfo,
@@ -185,7 +185,7 @@ impl PyServerInfo {
     fn title(&self) -> Option<&str> {
         self.inner.title.as_deref()
     }
-    fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         to_dict(py, &self.inner)
     }
     fn __repr__(&self) -> String {
@@ -203,7 +203,7 @@ impl From<ServerInfo> for PyServerInfo {
 }
 
 /// A tool definition.
-#[pyclass(name = "Tool", frozen)]
+#[pyclass(name = "Tool", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyTool {
     pub(crate) inner: Tool,
@@ -221,10 +221,10 @@ impl PyTool {
     }
     /// The JSON Schema for the tool's input (matches the `inputSchema` field).
     #[getter(inputSchema)]
-    fn input_schema(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn input_schema(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         json_to_py(py, &self.inner.input_schema)
     }
-    fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         to_dict(py, &self.inner)
     }
     fn __repr__(&self) -> String {
@@ -239,7 +239,7 @@ impl From<Tool> for PyTool {
 }
 
 /// Result of a `tools/call`.
-#[pyclass(name = "ToolResult", frozen)]
+#[pyclass(name = "ToolResult", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyToolResult {
     pub(crate) inner: ToolResult,
@@ -249,7 +249,7 @@ pub struct PyToolResult {
 impl PyToolResult {
     /// Content blocks returned by the tool (list of dicts).
     #[getter]
-    fn content(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn content(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         json_to_py(py, &Value::Array(self.inner.content.clone()))
     }
     #[getter(isError)]
@@ -261,7 +261,7 @@ impl PyToolResult {
     fn text(&self) -> String {
         self.inner.text()
     }
-    fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         to_dict(py, &self.inner)
     }
     fn __repr__(&self) -> String {
@@ -280,7 +280,7 @@ impl From<ToolResult> for PyToolResult {
 }
 
 /// A resource definition.
-#[pyclass(name = "Resource", frozen)]
+#[pyclass(name = "Resource", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyResource {
     pub(crate) inner: Resource,
@@ -304,7 +304,7 @@ impl PyResource {
     fn mime_type(&self) -> Option<&str> {
         self.inner.mime_type.as_deref()
     }
-    fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         to_dict(py, &self.inner)
     }
     fn __repr__(&self) -> String {
@@ -322,7 +322,7 @@ impl From<Resource> for PyResource {
 }
 
 /// Contents of a read resource (text or base64 blob).
-#[pyclass(name = "ResourceContent", frozen)]
+#[pyclass(name = "ResourceContent", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyResourceContent {
     pub(crate) inner: ResourceContent,
@@ -346,7 +346,7 @@ impl PyResourceContent {
     fn blob(&self) -> Option<&str> {
         self.inner.blob.as_deref()
     }
-    fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         to_dict(py, &self.inner)
     }
     fn __repr__(&self) -> String {
@@ -361,7 +361,7 @@ impl From<ResourceContent> for PyResourceContent {
 }
 
 /// Result of a `resources/read`.
-#[pyclass(name = "ReadResourceResult", frozen)]
+#[pyclass(name = "ReadResourceResult", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyReadResourceResult {
     pub(crate) inner: ReadResourceResult,
@@ -378,7 +378,7 @@ impl PyReadResourceResult {
             .map(PyResourceContent::from)
             .collect()
     }
-    fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         to_dict(py, &self.inner)
     }
     fn __repr__(&self) -> String {
@@ -393,7 +393,7 @@ impl From<ReadResourceResult> for PyReadResourceResult {
 }
 
 /// An argument a prompt template accepts.
-#[pyclass(name = "PromptArgument", frozen)]
+#[pyclass(name = "PromptArgument", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyPromptArgument {
     pub(crate) inner: PromptArgument,
@@ -413,7 +413,7 @@ impl PyPromptArgument {
     fn required(&self) -> Option<bool> {
         self.inner.required
     }
-    fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         to_dict(py, &self.inner)
     }
     fn __repr__(&self) -> String {
@@ -428,7 +428,7 @@ impl From<PromptArgument> for PyPromptArgument {
 }
 
 /// A prompt definition.
-#[pyclass(name = "Prompt", frozen)]
+#[pyclass(name = "Prompt", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyPrompt {
     pub(crate) inner: Prompt,
@@ -451,7 +451,7 @@ impl PyPrompt {
             .as_ref()
             .map(|args| args.iter().cloned().map(PyPromptArgument::from).collect())
     }
-    fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         to_dict(py, &self.inner)
     }
     fn __repr__(&self) -> String {
@@ -466,7 +466,7 @@ impl From<Prompt> for PyPrompt {
 }
 
 /// A message within a prompt.
-#[pyclass(name = "PromptMessage", frozen)]
+#[pyclass(name = "PromptMessage", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyPromptMessage {
     pub(crate) inner: PromptMessage,
@@ -479,10 +479,10 @@ impl PyPromptMessage {
         &self.inner.role
     }
     #[getter]
-    fn content(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn content(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         json_to_py(py, &self.inner.content)
     }
-    fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         to_dict(py, &self.inner)
     }
     fn __repr__(&self) -> String {
@@ -497,7 +497,7 @@ impl From<PromptMessage> for PyPromptMessage {
 }
 
 /// Result of a `prompts/get`.
-#[pyclass(name = "GetPromptResult", frozen)]
+#[pyclass(name = "GetPromptResult", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyGetPromptResult {
     pub(crate) inner: GetPromptResult,
@@ -516,7 +516,7 @@ impl PyGetPromptResult {
             .as_ref()
             .map(|msgs| msgs.iter().cloned().map(PyPromptMessage::from).collect())
     }
-    fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         to_dict(py, &self.inner)
     }
     fn __repr__(&self) -> String {
@@ -532,7 +532,7 @@ impl From<GetPromptResult> for PyGetPromptResult {
 }
 
 /// Result of `initialize`.
-#[pyclass(name = "InitializeResult", frozen)]
+#[pyclass(name = "InitializeResult", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyInitializeResult {
     pub(crate) inner: InitializeResult,
@@ -556,7 +556,7 @@ impl PyInitializeResult {
     fn instructions(&self) -> Option<&str> {
         self.inner.instructions.as_deref()
     }
-    fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         to_dict(py, &self.inner)
     }
     fn __repr__(&self) -> String {
@@ -574,7 +574,7 @@ impl From<InitializeResult> for PyInitializeResult {
 }
 
 /// Result of `tools/list`.
-#[pyclass(name = "ListToolsResult", frozen)]
+#[pyclass(name = "ListToolsResult", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyListToolsResult {
     pub(crate) inner: ListToolsResult,
@@ -590,7 +590,7 @@ impl PyListToolsResult {
     fn next_cursor(&self) -> Option<&str> {
         self.inner.next_cursor.as_deref()
     }
-    fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         to_dict(py, &self.inner)
     }
     fn __repr__(&self) -> String {
@@ -605,7 +605,7 @@ impl From<ListToolsResult> for PyListToolsResult {
 }
 
 /// Result of `resources/list`.
-#[pyclass(name = "ListResourcesResult", frozen)]
+#[pyclass(name = "ListResourcesResult", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyListResourcesResult {
     pub(crate) inner: ListResourcesResult,
@@ -626,7 +626,7 @@ impl PyListResourcesResult {
     fn next_cursor(&self) -> Option<&str> {
         self.inner.next_cursor.as_deref()
     }
-    fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         to_dict(py, &self.inner)
     }
     fn __repr__(&self) -> String {
@@ -644,7 +644,7 @@ impl From<ListResourcesResult> for PyListResourcesResult {
 }
 
 /// Result of `prompts/list`.
-#[pyclass(name = "ListPromptsResult", frozen)]
+#[pyclass(name = "ListPromptsResult", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyListPromptsResult {
     pub(crate) inner: ListPromptsResult,
@@ -665,7 +665,7 @@ impl PyListPromptsResult {
     fn next_cursor(&self) -> Option<&str> {
         self.inner.next_cursor.as_deref()
     }
-    fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         to_dict(py, &self.inner)
     }
     fn __repr__(&self) -> String {
