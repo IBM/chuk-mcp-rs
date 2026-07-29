@@ -49,7 +49,7 @@ pub(crate) fn to_py_err(e: chuk_mcp::McpError) -> PyErr {
     }
 }
 
-pub(crate) fn json_to_py(py: Python<'_>, value: &Value) -> PyResult<PyObject> {
+pub(crate) fn json_to_py(py: Python<'_>, value: &Value) -> PyResult<Py<PyAny>> {
     Ok(pythonize(py, value)?.unbind())
 }
 
@@ -70,7 +70,7 @@ pub(crate) fn coerce_to_json(value: &Bound<'_, PyAny>) -> PyResult<Value> {
 }
 
 /// Parameters for stdio transport.
-#[pyclass(name = "StdioParameters")]
+#[pyclass(name = "StdioParameters", from_py_object)]
 #[derive(Clone)]
 struct PyStdioParameters {
     inner: CoreStdioParameters,
@@ -348,7 +348,7 @@ impl PyMcpServer {
         &self,
         py: Python<'_>,
         name: &str,
-        handler: PyObject,
+        handler: Py<PyAny>,
         schema: Bound<'_, PyAny>,
         description: &str,
     ) -> PyResult<()> {
@@ -368,9 +368,9 @@ impl PyMcpServer {
                 // matching the historical chuk_mcp.MCPServer convention
                 // (e.g. `async def greet(name): ...`). Falls back to a single
                 // positional argument if the payload isn't an object.
-                let future = Python::with_gil(|py| -> PyResult<_> {
+                let future = Python::attach(|py| -> PyResult<_> {
                     let args_obj = pythonize(py, &args)?;
-                    let coroutine = match args_obj.downcast::<PyDict>() {
+                    let coroutine = match args_obj.cast::<PyDict>() {
                         Ok(kwargs) => handler.bind(py).call((), Some(kwargs))?,
                         Err(_) => handler.bind(py).call1((args_obj,))?,
                     };
@@ -379,7 +379,7 @@ impl PyMcpServer {
                 .map_err(|e| e.to_string())?;
 
                 let result = future.await.map_err(|e| e.to_string())?;
-                Python::with_gil(|py| py_to_json(result.bind(py))).map_err(|e| e.to_string())
+                Python::attach(|py| py_to_json(result.bind(py))).map_err(|e| e.to_string())
             }
         });
         Ok(())
@@ -391,7 +391,7 @@ impl PyMcpServer {
         &self,
         py: Python<'_>,
         uri: &str,
-        handler: PyObject,
+        handler: Py<PyAny>,
         name: &str,
         description: &str,
         mime_type: &str,
@@ -406,15 +406,14 @@ impl PyMcpServer {
         server.register_resource(uri, name, description, mime_type, move || {
             let handler = handler.clone();
             async move {
-                let future = Python::with_gil(|py| -> PyResult<_> {
+                let future = Python::attach(|py| -> PyResult<_> {
                     let coroutine = handler.bind(py).call0()?;
                     pyo3_async_runtimes::tokio::into_future(coroutine)
                 })
                 .map_err(|e| e.to_string())?;
 
                 let result = future.await.map_err(|e| e.to_string())?;
-                Python::with_gil(|py| result.bind(py).extract::<String>())
-                    .map_err(|e| e.to_string())
+                Python::attach(|py| result.bind(py).extract::<String>()).map_err(|e| e.to_string())
             }
         });
         Ok(())

@@ -44,14 +44,14 @@ use crate::types::{
 use crate::{json_to_py, py_to_json, to_py_err};
 
 /// Opaque handle to a transport's inbound message stream.
-#[pyclass(name = "ReadStream", frozen)]
+#[pyclass(name = "ReadStream", frozen, from_py_object)]
 #[derive(Clone)]
 pub struct PyReadStream {
     pub(crate) inner: ReadStream,
 }
 
 /// Opaque handle to a transport's outbound message stream.
-#[pyclass(name = "WriteStream", frozen)]
+#[pyclass(name = "WriteStream", frozen, from_py_object)]
 #[derive(Clone)]
 pub struct PyWriteStream {
     pub(crate) inner: WriteStream,
@@ -287,7 +287,7 @@ pub fn send_message<'py>(
         let result = core_send_message(&read.inner, &write.inner, &method, params)
             .await
             .map_err(to_py_err)?;
-        Python::with_gil(|py| json_to_py(py, &result))
+        Python::attach(|py| json_to_py(py, &result))
     })
 }
 
@@ -381,7 +381,7 @@ pub fn send_roots_list<'py>(
         let result = core_roots_list(&read.inner, &write.inner)
             .await
             .map_err(to_py_err)?;
-        Python::with_gil(|py| json_to_py(py, &serde_json::to_value(result).unwrap()))
+        Python::attach(|py| json_to_py(py, &serde_json::to_value(result).unwrap()))
     })
 }
 
