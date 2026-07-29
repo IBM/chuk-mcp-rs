@@ -34,7 +34,8 @@ use crate::protocol::json_rpc::{
 };
 use crate::protocol::messages::send_message::{message_channel, ReadStream, WriteStream};
 use crate::protocol::types::errors::{
-    McpError, CONNECTION_CLOSED, INTERNAL_ERROR, INVALID_PARAMS, PARSE_ERROR,
+    McpError, LOCAL_MALFORMED_RESPONSE, LOCAL_REQUEST_REJECTED, LOCAL_STREAM_LOST,
+    LOCAL_TRANSPORT_FAILURE,
 };
 use crate::protocol::versioning;
 use crate::transports::Transport;
@@ -218,7 +219,7 @@ pub(crate) async fn dispatch_modern(
         route_error(
             incoming_tx,
             &caller_id,
-            INVALID_PARAMS,
+            LOCAL_REQUEST_REJECTED,
             "modern Streamable HTTP sends one request or notification per POST",
         )
         .await;
@@ -235,7 +236,13 @@ pub(crate) async fn dispatch_modern(
         Err(e) => {
             // e.g. tools/call without a name: rejected here rather than
             // becoming a -32020 round trip.
-            route_error(incoming_tx, &caller_id, INVALID_PARAMS, &e.to_string()).await;
+            route_error(
+                incoming_tx,
+                &caller_id,
+                LOCAL_REQUEST_REJECTED,
+                &e.to_string(),
+            )
+            .await;
             return Dispatched::HandledUndetermined;
         }
     };
@@ -279,7 +286,7 @@ pub(crate) async fn dispatch_modern(
                 route_error(
                     incoming_tx,
                     &caller_id,
-                    CONNECTION_CLOSED,
+                    LOCAL_STREAM_LOST,
                     "response stream ended before a response arrived, and re-issuing \
                      the request did not succeed",
                 )
@@ -337,7 +344,13 @@ async fn send_once(
         Ok(response) => response,
         Err(e) => {
             // A connection-level failure says nothing about the protocol.
-            route_error(incoming_tx, caller_id, INTERNAL_ERROR, &e.to_string()).await;
+            route_error(
+                incoming_tx,
+                caller_id,
+                LOCAL_TRANSPORT_FAILURE,
+                &e.to_string(),
+            )
+            .await;
             return Attempt::Reported(Detection::Undetermined);
         }
     };
@@ -373,7 +386,7 @@ async fn send_once(
         route_error(
             incoming_tx,
             caller_id,
-            INTERNAL_ERROR,
+            LOCAL_TRANSPORT_FAILURE,
             &format!("HTTP {status}: {text}"),
         )
         .await;
@@ -406,7 +419,7 @@ async fn send_once(
             route_error(
                 incoming_tx,
                 caller_id,
-                PARSE_ERROR,
+                LOCAL_MALFORMED_RESPONSE,
                 &format!("Parse error: {e}"),
             )
             .await;
@@ -670,7 +683,12 @@ mod tests {
             "response id should be rewritten onto the caller's"
         );
 
-        let error = JsonRpcMessage::Error(create_error_response(wire, INTERNAL_ERROR, "x", None));
+        let error = JsonRpcMessage::Error(create_error_response(
+            wire,
+            LOCAL_TRANSPORT_FAILURE,
+            "x",
+            None,
+        ));
         assert_eq!(retarget(error, &caller).id(), Some(&RequestId::Num(1)));
 
         // Notifications have no id and pass through untouched.

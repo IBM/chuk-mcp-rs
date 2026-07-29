@@ -14,6 +14,10 @@ use tokio::net::{TcpListener, TcpStream};
 
 use chuk_mcp::protocol::json_rpc::{create_request, JsonRpcMessage, RequestId};
 use chuk_mcp::protocol::messages::send_message::{ReadStream, WriteStream};
+use chuk_mcp::protocol::types::errors::{
+    is_local_error, LOCAL_MALFORMED_RESPONSE, LOCAL_REQUEST_REJECTED, LOCAL_STREAM_LOST,
+    LOCAL_TRANSPORT_FAILURE,
+};
 use chuk_mcp::transports::http_modern::{ModernHttpParameters, ModernHttpTransport};
 use chuk_mcp::transports::Transport;
 
@@ -401,6 +405,9 @@ async fn retries_are_bounded_and_then_reported() {
                 "unexpected message: {}",
                 e.error.message
             );
+            // Locally raised, so it must not look like something the peer said.
+            assert_eq!(e.error.code, LOCAL_STREAM_LOST);
+            assert!(is_local_error(e.error.code));
         }
         other => panic!("expected an error, got {other:?}"),
     }
@@ -458,6 +465,8 @@ async fn a_modern_protocol_error_reaches_the_caller_intact() {
     match &response {
         JsonRpcMessage::Error(e) => {
             assert_eq!(e.error.code, UNSUPPORTED_PROTOCOL_VERSION);
+            // The peer's own code, passed through — emphatically *not* local.
+            assert!(!is_local_error(e.error.code));
             // The `supported` list survives, so the client can retry.
             assert_eq!(
                 e.error.data.as_ref().unwrap()["supported"],
@@ -478,7 +487,11 @@ async fn a_non_jsonrpc_error_body_still_reaches_the_caller() {
 
     let response = call(&read, &write, "tools/list", json!({}), RequestId::Num(1)).await;
     match &response {
-        JsonRpcMessage::Error(e) => assert!(e.error.message.contains("404"), "{}", e.error.message),
+        JsonRpcMessage::Error(e) => {
+            assert!(e.error.message.contains("404"), "{}", e.error.message);
+            // Our summary of an HTTP failure, not a JSON-RPC error the peer sent.
+            assert_eq!(e.error.code, LOCAL_TRANSPORT_FAILURE);
+        }
         other => panic!("expected an error, got {other:?}"),
     }
 }
@@ -491,11 +504,14 @@ async fn an_unparseable_body_becomes_a_parse_error() {
 
     let response = call(&read, &write, "tools/list", json!({}), RequestId::Num(1)).await;
     match &response {
-        JsonRpcMessage::Error(e) => assert!(
-            e.error.message.contains("Parse error"),
-            "{}",
-            e.error.message
-        ),
+        JsonRpcMessage::Error(e) => {
+            assert!(
+                e.error.message.contains("Parse error"),
+                "{}",
+                e.error.message
+            );
+            assert_eq!(e.error.code, LOCAL_MALFORMED_RESPONSE);
+        }
         other => panic!("expected a parse error, got {other:?}"),
     }
 }
@@ -568,7 +584,10 @@ async fn a_missing_mcp_name_source_fails_without_a_round_trip() {
 
     // tools/call requires Mcp-Name, sourced from params.name.
     let response = call(&read, &write, "tools/call", json!({}), RequestId::Num(3)).await;
-    assert!(matches!(response, JsonRpcMessage::Error(_)));
+    match &response {
+        JsonRpcMessage::Error(e) => assert_eq!(e.error.code, LOCAL_REQUEST_REJECTED),
+        other => panic!("expected a local rejection, got {other:?}"),
+    }
     assert!(
         log.lock().unwrap().is_empty(),
         "the request should never have reached the server"

@@ -64,6 +64,49 @@ pub const MODERN_PROTOCOL_ERRORS: &[i64] = &[
 /// `Invalid Params`. Legacy peers use [`MCP_RESOURCE_NOT_FOUND`] instead.
 pub const MODERN_RESOURCE_NOT_FOUND: i64 = INVALID_PARAMS;
 
+// ---------------------------------------------------------------------------
+// Locally-raised errors.
+//
+// A client that reports its own failures as JSON-RPC error objects — a timeout,
+// a dead socket, a request it refused to send — must keep them distinguishable
+// from errors a peer actually sent, or a caller cannot tell "the server rejected
+// this" from "we never got an answer". The specification leaves local errors
+// unassigned and asks that new codes be allocated *outside* the JSON-RPC
+// reserved range (`-32768..=-32000`), so these sit above it.
+//
+// The 2026-07-28 revision reinforces this: `-32000..=-32019` is the grandfathered
+// implementation sub-range that new code SHOULD NOT use at all, and receivers
+// MUST NOT assume meaning for codes in it.
+// ---------------------------------------------------------------------------
+
+/// Low end of the range this library uses for its own errors.
+pub const LOCAL_ERROR_END: i64 = -31099;
+/// High end of the range this library uses for its own errors.
+pub const LOCAL_ERROR_START: i64 = -31000;
+
+/// The request never reached the peer, or its reply never arrived.
+pub const LOCAL_TRANSPORT_FAILURE: i64 = -31001;
+/// The response stream ended before a response arrived, and re-issuing the
+/// request did not recover it.
+pub const LOCAL_STREAM_LOST: i64 = -31002;
+/// The client declined to send the request as written — it would have been
+/// rejected on arrival.
+pub const LOCAL_REQUEST_REJECTED: i64 = -31003;
+/// The peer answered, but its body could not be parsed.
+pub const LOCAL_MALFORMED_RESPONSE: i64 = -31004;
+
+/// Whether this library raised the error itself, rather than receiving it.
+pub fn is_local_error(code: i64) -> bool {
+    (LOCAL_ERROR_END..=LOCAL_ERROR_START).contains(&code)
+}
+
+/// Whether the code lies in the JSON-RPC reserved range (`-32768..=-32000`).
+///
+/// Locally-raised errors must fall outside it; see [`is_local_error`].
+pub fn is_jsonrpc_reserved(code: i64) -> bool {
+    (-32768..=-32000).contains(&code)
+}
+
 /// Errors that are permanent and should not be retried.
 pub const NON_RETRYABLE_ERRORS: &[i64] = &[
     PARSE_ERROR,
@@ -83,6 +126,11 @@ pub const NON_RETRYABLE_ERRORS: &[i64] = &[
     HEADER_MISMATCH,
     MISSING_REQUIRED_CLIENT_CAPABILITY,
     UNSUPPORTED_PROTOCOL_VERSION,
+    // Locally-raised and already final. LOCAL_TRANSPORT_FAILURE is absent on
+    // purpose: a dead socket may well succeed on a retry.
+    LOCAL_STREAM_LOST,
+    LOCAL_REQUEST_REJECTED,
+    LOCAL_MALFORMED_RESPONSE,
 ];
 
 /// Errors that might be transient and worth retrying.
@@ -117,6 +165,10 @@ pub fn get_error_message(code: i64) -> String {
             "Request omitted a client capability the server requires".into()
         }
         UNSUPPORTED_PROTOCOL_VERSION => "Unsupported protocol version".into(),
+        LOCAL_TRANSPORT_FAILURE => "Local: the request or its reply did not arrive".into(),
+        LOCAL_STREAM_LOST => "Local: the response stream was lost".into(),
+        LOCAL_REQUEST_REJECTED => "Local: the client declined to send the request".into(),
+        LOCAL_MALFORMED_RESPONSE => "Local: the peer's response could not be parsed".into(),
         other => format!("Unknown error: Code {other}"),
     }
 }
@@ -459,6 +511,51 @@ mod tests {
         assert!(McpError::from_json_rpc(INTERNAL_ERROR, "x", None)
             .data()
             .is_none());
+    }
+
+    #[test]
+    fn local_errors_cannot_be_mistaken_for_a_peers() {
+        // The whole point of the local range: a caller must be able to tell
+        // "the server rejected this" from "we never got an answer".
+        for code in [
+            LOCAL_TRANSPORT_FAILURE,
+            LOCAL_STREAM_LOST,
+            LOCAL_REQUEST_REJECTED,
+            LOCAL_MALFORMED_RESPONSE,
+        ] {
+            assert!(is_local_error(code), "{code} should be a local code");
+            assert!(
+                !is_jsonrpc_reserved(code),
+                "{code} must sit outside the JSON-RPC reserved range"
+            );
+            assert!(!is_server_error(code));
+            assert!(!is_spec_reserved_error(code));
+            assert!(!is_mcp_specific_error(code));
+            assert!(!get_error_message(code).contains("Unknown"));
+        }
+
+        // Conversely, nothing we might receive is mistaken for local.
+        for code in [
+            PARSE_ERROR,
+            INVALID_PARAMS,
+            INTERNAL_ERROR,
+            CONNECTION_CLOSED,
+            MCP_RESOURCE_NOT_FOUND,
+            HEADER_MISMATCH,
+            UNSUPPORTED_PROTOCOL_VERSION,
+        ] {
+            assert!(!is_local_error(code), "{code} is a wire code, not local");
+            assert!(is_jsonrpc_reserved(code));
+        }
+    }
+
+    #[test]
+    fn local_finality_matches_whether_a_retry_could_help() {
+        // A dead socket may well work next time; the others are settled.
+        assert!(is_retryable_error(LOCAL_TRANSPORT_FAILURE));
+        assert!(!is_retryable_error(LOCAL_STREAM_LOST));
+        assert!(!is_retryable_error(LOCAL_REQUEST_REJECTED));
+        assert!(!is_retryable_error(LOCAL_MALFORMED_RESPONSE));
     }
 
     #[test]
