@@ -27,6 +27,7 @@ use async_trait::async_trait;
 use tokio::sync::{mpsc, Semaphore};
 
 use crate::protocol::envelope::{self, ClientIdentity, Envelope};
+use crate::protocol::era::{self, Detection};
 use crate::protocol::json_rpc::{
     create_error_response, create_notification, create_request, create_response, parse_message_str,
     JsonRpcMessage, RequestId,
@@ -148,7 +149,7 @@ impl ModernHttpTransport {
                 let incoming_tx = incoming_tx.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    dispatch(&client, &params, &incoming_tx, message).await;
+                    dispatch_modern(&client, &params, &incoming_tx, message, false).await;
                 });
             }
         });
@@ -168,17 +169,48 @@ enum Attempt {
     Completed,
     /// The stream ended with no response. The request is lost; re-issue it.
     StreamBroken,
-    /// A terminal condition was already reported to the caller.
-    Reported,
+    /// A terminal condition was already reported to the caller. The carried
+    /// [`Detection`] records what, if anything, the failure proved about the
+    /// peer's era — a `401` or `5xx` proves nothing either way.
+    Reported(Detection),
+    /// The response identifies the peer as *not* modern. Nothing was routed to
+    /// the caller, so the request can be re-sent under the legacy lifecycle.
+    NotModern,
+}
+
+/// How a dispatch ended, from a dual-era caller's point of view.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Dispatched {
+    /// The caller has been answered, and the peer positively identified itself
+    /// as modern — either by succeeding or by returning a recognised modern
+    /// error. Safe to cache.
+    HandledModern,
+    /// The caller has been answered, but nothing was learned about the era: a
+    /// timeout, an auth failure, a `5xx`. **Must not** be cached, or a
+    /// momentarily unhealthy server would be pinned to an era it never claimed.
+    HandledUndetermined,
+    /// The peer is legacy and nothing was routed. Re-send this request through
+    /// the legacy transport.
+    ///
+    /// Re-sending is safe: every response that yields this verdict — a `400`
+    /// without a modern error, a bare `404`, a `405` — means the request was
+    /// rejected before being processed, so there is no risk of executing it
+    /// twice.
+    FallBackToLegacy,
 }
 
 /// Send one outgoing message, retrying a broken response stream under a new id.
-async fn dispatch(
+///
+/// `allow_fallback` is set only while the peer's era is still unknown. Once an
+/// endpoint is known to be modern, a `400` is a real error and must reach the
+/// caller rather than silently triggering a legacy retry.
+pub(crate) async fn dispatch_modern(
     client: &reqwest::Client,
     params: &ModernHttpParameters,
     incoming_tx: &mpsc::Sender<JsonRpcMessage>,
     message: JsonRpcMessage,
-) {
+    allow_fallback: bool,
+) -> Dispatched {
     let caller_id = message.id().cloned();
     let Some(method) = message.method().map(str::to_string) else {
         // Only requests and notifications go out; a client must not send
@@ -190,7 +222,7 @@ async fn dispatch(
             "modern Streamable HTTP sends one request or notification per POST",
         )
         .await;
-        return;
+        return Dispatched::HandledUndetermined;
     };
 
     let envelope = match envelope::build_envelope(
@@ -204,7 +236,7 @@ async fn dispatch(
             // e.g. tools/call without a name: rejected here rather than
             // becoming a -32020 round trip.
             route_error(incoming_tx, &caller_id, INVALID_PARAMS, &e.to_string()).await;
-            return;
+            return Dispatched::HandledUndetermined;
         }
     };
 
@@ -222,7 +254,19 @@ async fn dispatch(
             (Some(_), _) => Some(RequestId::Str(uuid::Uuid::new_v4().to_string())),
         };
 
-        match send_once(client, params, incoming_tx, &envelope, &wire_id, &caller_id).await {
+        match send_once(
+            client,
+            params,
+            incoming_tx,
+            &envelope,
+            &wire_id,
+            &caller_id,
+            allow_fallback,
+        )
+        .await
+        {
+            Attempt::NotModern => return Dispatched::FallBackToLegacy,
+            // A stream only exists after a 2xx, so the peer is modern either way.
             Attempt::StreamBroken if attempt < params.max_stream_retries => {
                 tracing::debug!(
                     "response stream for {caller_id:?} ended without a response; \
@@ -240,9 +284,11 @@ async fn dispatch(
                      the request did not succeed",
                 )
                 .await;
-                return;
+                return Dispatched::HandledModern;
             }
-            Attempt::Completed | Attempt::Reported => return,
+            Attempt::Completed => return Dispatched::HandledModern,
+            Attempt::Reported(Detection::Undetermined) => return Dispatched::HandledUndetermined,
+            Attempt::Reported(_) => return Dispatched::HandledModern,
         }
     }
 }
@@ -255,6 +301,7 @@ async fn send_once(
     envelope: &Envelope,
     wire_id: &Option<RequestId>,
     caller_id: &Option<RequestId>,
+    allow_fallback: bool,
 ) -> Attempt {
     let body = match wire_id {
         Some(id) => JsonRpcMessage::Request(create_request(
@@ -289,8 +336,9 @@ async fn send_once(
     let response = match request.json(&body.to_value()).send().await {
         Ok(response) => response,
         Err(e) => {
+            // A connection-level failure says nothing about the protocol.
             route_error(incoming_tx, caller_id, INTERNAL_ERROR, &e.to_string()).await;
-            return Attempt::Reported;
+            return Attempt::Reported(Detection::Undetermined);
         }
     };
 
@@ -304,12 +352,22 @@ async fn send_once(
 
     if status >= 400 {
         let text = response.text().await.unwrap_or_default();
+
+        // While the era is still unknown, an error response is also the probe.
+        // Only a *recognised modern* error proves a modern peer; anything else
+        // means fall back rather than surface a failure the legacy lifecycle
+        // would have handled fine.
+        if allow_fallback && era::classify_http_response(status, &text) == Detection::Legacy {
+            tracing::debug!("HTTP {status} identifies a legacy peer; falling back");
+            return Attempt::NotModern;
+        }
+
         // Route the server's own JSON-RPC error when it sent one, so callers
         // see -32020/-32021/-32022 rather than an opaque transport failure.
         if let Ok(message) = parse_message_str(&text) {
             if matches!(message, JsonRpcMessage::Error(_)) {
                 let _ = incoming_tx.send(retarget(message, caller_id)).await;
-                return Attempt::Reported;
+                return Attempt::Reported(era::classify_http_response(status, &text));
             }
         }
         route_error(
@@ -319,7 +377,7 @@ async fn send_once(
             &format!("HTTP {status}: {text}"),
         )
         .await;
-        return Attempt::Reported;
+        return Attempt::Reported(era::classify_http_response(status, &text));
     }
 
     if content_type.contains("text/event-stream") {
@@ -344,6 +402,7 @@ async fn send_once(
             Attempt::Completed
         }
         Err(e) => {
+            // A 2xx arrived, so the peer is modern; its body was just unusable.
             route_error(
                 incoming_tx,
                 caller_id,
@@ -351,7 +410,7 @@ async fn send_once(
                 &format!("Parse error: {e}"),
             )
             .await;
-            Attempt::Reported
+            Attempt::Reported(Detection::Modern)
         }
     }
 }

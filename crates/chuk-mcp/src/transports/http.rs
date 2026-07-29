@@ -143,7 +143,11 @@ impl StreamableHttpTransport {
 }
 
 /// POST one message and route its response(s) to the incoming stream.
-async fn send_via_http(
+///
+/// `pub(crate)` so the dual-era transport can reuse the legacy path verbatim
+/// rather than reimplementing it. Visibility only — the behaviour of this
+/// transport is frozen until its deprecation window closes.
+pub(crate) async fn send_via_http(
     client: &reqwest::Client,
     params: &StreamableHttpParameters,
     session: &Arc<std::sync::Mutex<Option<String>>>,

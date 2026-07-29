@@ -1,6 +1,7 @@
 //! Pluggable transport implementations, mirroring `chuk_mcp.transports`.
 
 pub mod http;
+pub mod http_dual;
 pub mod http_modern;
 pub mod sse;
 pub mod stdio;
