@@ -5,8 +5,18 @@ pub struct MessageMethod;
 
 impl MessageMethod {
     // Core protocol methods
+    //
+    // `PING` and `INITIALIZE` exist only in the legacy era; the 2026-07-28
+    // revision removed both. `SERVER_DISCOVER` replaces them as the way a
+    // client learns a server's versions, capabilities and identity — and
+    // servers MUST implement it.
     pub const PING: &'static str = "ping";
     pub const INITIALIZE: &'static str = "initialize";
+    pub const SERVER_DISCOVER: &'static str = "server/discover";
+
+    // Modern subscription stream (replaces the HTTP GET endpoint and
+    // resources/subscribe + resources/unsubscribe).
+    pub const SUBSCRIPTIONS_LISTEN: &'static str = "subscriptions/listen";
 
     // Resource methods
     pub const RESOURCES_LIST: &'static str = "resources/list";

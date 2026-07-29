@@ -160,35 +160,36 @@ pub struct ServerProfile {
     pub server_info: Option<ServerInfo>,
     /// Extension declarations lifted from `capabilities.extensions`.
     pub extensions: Map<String, Value>,
+    /// Optional natural-language guidance for LLMs on using this server.
+    pub instructions: Option<String>,
 }
 
 impl ServerProfile {
-    /// Build a profile from a `server/discover` result.
+    /// Build a profile from a `server/discover` [`DiscoverResult`].
     ///
-    /// Accepts either `protocolVersions` (an array, which is what a server
-    /// advertising multiple revisions returns) or a single `protocolVersion`,
-    /// and negotiates the best mutually supported version from it.
+    /// The advertised versions live in `supportedVersions`, and the server's
+    /// identity in `_meta["io.modelcontextprotocol/serverInfo"]` rather than at
+    /// the top level — unlike the legacy `initialize` result, where `serverInfo`
+    /// is a sibling of `capabilities`.
+    ///
+    /// [`DiscoverResult`]: https://modelcontextprotocol.io/specification/2026-07-28/server/discover
     pub fn from_discover(value: &Value) -> Result<Self, McpError> {
         let obj = value.as_object().ok_or_else(|| {
             McpError::protocol(INVALID_REQUEST, "server/discover result is not an object")
         })?;
 
-        let advertised: Vec<String> = match obj.get("protocolVersions") {
+        let advertised: Vec<String> = match obj.get("supportedVersions") {
             Some(Value::Array(items)) => items
                 .iter()
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect(),
-            _ => obj
-                .get("protocolVersion")
-                .and_then(Value::as_str)
-                .map(|s| vec![s.to_string()])
-                .unwrap_or_default(),
+            _ => Vec::new(),
         };
 
         if advertised.is_empty() {
             return Err(McpError::protocol(
                 INVALID_REQUEST,
-                "server/discover result advertised no protocol versions",
+                "server/discover result declared no supportedVersions",
             ));
         }
 
@@ -202,7 +203,11 @@ impl ServerProfile {
             protocol_version,
             supported_versions: advertised,
             extensions: Self::extensions_of(&capabilities),
-            server_info: Self::server_info_of(obj),
+            server_info: crate::protocol::meta::server_info_of(value),
+            instructions: obj
+                .get("instructions")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             capabilities,
         })
     }
@@ -231,7 +236,12 @@ impl ServerProfile {
             supported_versions: vec![protocol_version.clone()],
             protocol_version,
             extensions: Self::extensions_of(&capabilities),
+            // Legacy puts serverInfo at the top level, not in `_meta`.
             server_info: Self::server_info_of(obj),
+            instructions: obj
+                .get("instructions")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             capabilities,
         })
     }
@@ -371,14 +381,22 @@ mod tests {
     }
 
     #[test]
-    fn profile_from_discover() {
+    fn profile_from_discover_matches_the_specification_example() {
+        // Shaped exactly like the DiscoverResult example in the spec: versions
+        // under `supportedVersions`, identity inside `_meta`.
         let profile = ServerProfile::from_discover(&json!({
-            "protocolVersions": ["2026-07-28", "2025-06-18"],
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28", "2025-06-18"],
             "capabilities": {
                 "tools": {"listChanged": true},
                 "extensions": {"io.modelcontextprotocol/tasks": {}}
             },
-            "serverInfo": {"name": "demo", "version": "1.2.3"}
+            "_meta": {
+                "io.modelcontextprotocol/serverInfo": {"name": "demo", "version": "1.2.3"}
+            },
+            "instructions": "This server provides weather utilities.",
+            "ttlMs": 3600000,
+            "cacheScope": "public"
         }))
         .unwrap();
 
@@ -386,6 +404,10 @@ mod tests {
         assert_eq!(profile.protocol_version, "2026-07-28");
         assert_eq!(profile.supported_versions.len(), 2);
         assert_eq!(profile.server_info.unwrap().name, "demo");
+        assert_eq!(
+            profile.instructions.as_deref(),
+            Some("This server provides weather utilities.")
+        );
         assert!(profile.capabilities.tools.is_some());
         assert!(profile
             .extensions
@@ -396,7 +418,7 @@ mod tests {
     fn discover_negotiates_down_to_a_shared_version() {
         // A server that only speaks legacy versions but implements discover.
         let profile = ServerProfile::from_discover(&json!({
-            "protocolVersions": ["2025-03-26", "2024-11-05"]
+            "supportedVersions": ["2025-03-26", "2024-11-05"]
         }))
         .unwrap();
         assert_eq!(profile.protocol_version, "2025-03-26");
@@ -404,13 +426,27 @@ mod tests {
     }
 
     #[test]
+    fn discover_tolerates_a_missing_server_info() {
+        // serverInfo is only SHOULD-level, so its absence must not fail parsing.
+        let profile =
+            ServerProfile::from_discover(&json!({"supportedVersions": ["2026-07-28"]})).unwrap();
+        assert!(profile.server_info.is_none());
+        assert!(profile.instructions.is_none());
+        assert_eq!(profile.era, ProtocolEra::Modern);
+    }
+
+    #[test]
     fn discover_rejects_unusable_results() {
         assert!(ServerProfile::from_discover(&json!("nope")).is_err());
         assert!(ServerProfile::from_discover(&json!({})).is_err());
-        assert!(ServerProfile::from_discover(&json!({"protocolVersions": []})).is_err());
+        assert!(ServerProfile::from_discover(&json!({"supportedVersions": []})).is_err());
         // No mutually supported version.
         assert!(
-            ServerProfile::from_discover(&json!({"protocolVersions": ["1999-01-01"]})).is_err()
+            ServerProfile::from_discover(&json!({"supportedVersions": ["1999-01-01"]})).is_err()
+        );
+        // `protocolVersions` was never the real field name; it must not work.
+        assert!(
+            ServerProfile::from_discover(&json!({"protocolVersions": ["2026-07-28"]})).is_err()
         );
     }
 

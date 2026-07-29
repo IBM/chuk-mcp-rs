@@ -21,6 +21,7 @@ futures.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 reqwest.workspace = true
 tracing.workspace = true
 

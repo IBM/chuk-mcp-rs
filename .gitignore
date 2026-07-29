@@ -1,6 +1,10 @@
 /target
 Cargo.lock.bak
 
+# Coverage artifacts
+coverage.json
+*.profraw
+
 # Python / maturin build artifacts
 *.so
 *.pyd
