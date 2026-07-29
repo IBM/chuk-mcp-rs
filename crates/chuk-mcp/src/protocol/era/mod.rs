@@ -21,13 +21,14 @@ mod detect;
 
 pub use cache::{EndpointKey, EraCache, DEFAULT_ERA_TTL};
 pub use detect::{
-    classify_http_error_body, classify_probe_error, classify_probe_result, Detection,
+    classify_http_error_body, classify_http_response, classify_probe_error, classify_probe_result,
+    Detection,
 };
 
 use serde_json::{Map, Value};
 
 use crate::protocol::types::capabilities::ServerCapabilities;
-use crate::protocol::types::errors::{McpError, INVALID_REQUEST};
+use crate::protocol::types::errors::{McpError, INVALID_REQUEST, UNSUPPORTED_PROTOCOL_VERSION};
 use crate::protocol::types::info::ServerInfo;
 use crate::protocol::versioning;
 
@@ -142,6 +143,34 @@ impl std::fmt::Display for EraMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// The versions a peer advertised in an `UnsupportedProtocolVersionError`.
+///
+/// The error carries `data.supported`; a `-32022` without it tells us only that
+/// our version was refused.
+pub fn advertised_versions(err: &McpError) -> Option<Vec<String>> {
+    if err.code() != Some(UNSUPPORTED_PROTOCOL_VERSION) {
+        return None;
+    }
+    let supported = err.data()?.get("supported")?.as_array()?;
+    let versions: Vec<String> = supported
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    (!versions.is_empty()).then_some(versions)
+}
+
+/// Choose a version to retry with after a `-32022`.
+///
+/// A rejected version is not a dead end: the server lists what it does support,
+/// and the client retries rather than failing. Returns `None` when nothing is
+/// mutually supported — the only case that is genuinely unrecoverable, and the
+/// point at which the caller should surface an error naming both sides' versions.
+pub fn renegotiate(err: &McpError) -> Option<String> {
+    let advertised = advertised_versions(err)?;
+    let refs: Vec<&str> = advertised.iter().map(String::as_str).collect();
+    versioning::negotiate_version(versioning::SUPPORTED_VERSIONS, &refs).ok()
 }
 
 /// What a peer told us about itself, however we learned it.
@@ -378,6 +407,80 @@ mod tests {
             EraMode::Auto.resolve(Some(ProtocolEra::Legacy)),
             Some(ProtocolEra::Legacy)
         );
+    }
+
+    #[test]
+    fn renegotiates_from_the_specification_error_example() {
+        // The exact -32022 payload the spec documents.
+        let err = McpError::NonRetryable {
+            code: UNSUPPORTED_PROTOCOL_VERSION,
+            message: "Unsupported protocol version".into(),
+            data: Some(json!({
+                "supported": ["2026-07-28", "2025-11-25"],
+                "requested": "1900-01-01"
+            })),
+        };
+
+        assert_eq!(
+            advertised_versions(&err).unwrap(),
+            vec!["2026-07-28", "2025-11-25"]
+        );
+        // We pick our most-preferred mutually supported version, not the
+        // server's first: 2025-11-25 is one we deliberately do not support.
+        assert_eq!(renegotiate(&err).as_deref(), Some("2026-07-28"));
+    }
+
+    #[test]
+    fn renegotiation_falls_back_to_a_legacy_version() {
+        // A server that dropped modern support. We must still find common
+        // ground rather than treating the rejection as fatal.
+        let err = McpError::NonRetryable {
+            code: UNSUPPORTED_PROTOCOL_VERSION,
+            message: "nope".into(),
+            data: Some(json!({"supported": ["2025-03-26", "2024-11-05"]})),
+        };
+        assert_eq!(renegotiate(&err).as_deref(), Some("2025-03-26"));
+    }
+
+    #[test]
+    fn renegotiation_gives_up_only_when_nothing_overlaps() {
+        // No mutually supported version is the one genuinely fatal case.
+        let hopeless = McpError::NonRetryable {
+            code: UNSUPPORTED_PROTOCOL_VERSION,
+            message: "nope".into(),
+            data: Some(json!({"supported": ["1999-01-01"]})),
+        };
+        assert!(advertised_versions(&hopeless).is_some());
+        assert!(renegotiate(&hopeless).is_none());
+    }
+
+    #[test]
+    fn renegotiation_ignores_unrelated_and_malformed_errors() {
+        // Only -32022 carries a version list.
+        let other = McpError::from_json_rpc(
+            crate::protocol::types::errors::HEADER_MISMATCH,
+            "nope",
+            Some(json!({"supported": ["2026-07-28"]})),
+        );
+        assert!(advertised_versions(&other).is_none());
+        assert!(renegotiate(&other).is_none());
+
+        // -32022 shapes that carry nothing usable.
+        for data in [
+            None,
+            Some(json!({})),
+            Some(json!({"supported": []})),
+            Some(json!({"supported": "2026-07-28"})),
+            Some(json!({"supported": [1, 2, 3]})),
+        ] {
+            let err = McpError::NonRetryable {
+                code: UNSUPPORTED_PROTOCOL_VERSION,
+                message: "nope".into(),
+                data,
+            };
+            assert!(advertised_versions(&err).is_none());
+            assert!(renegotiate(&err).is_none());
+        }
     }
 
     #[test]

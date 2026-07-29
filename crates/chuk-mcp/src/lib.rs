@@ -30,7 +30,9 @@ pub mod transports;
 
 pub use client::{connect_to_server, McpClient};
 pub use protocol::envelope::{build_envelope, ClientIdentity, Envelope};
-pub use protocol::era::{Detection, EndpointKey, EraCache, EraMode, ProtocolEra, ServerProfile};
+pub use protocol::era::{
+    renegotiate, Detection, EndpointKey, EraCache, EraMode, ProtocolEra, ServerProfile,
+};
 pub use protocol::json_rpc::JsonRpcMessage;
 pub use protocol::meta::RequestMeta;
 pub use protocol::types::capabilities::{ClientCapabilities, ServerCapabilities};

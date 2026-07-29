@@ -95,6 +95,55 @@ pub fn classify_http_error_body(body: &str) -> Detection {
     }
 }
 
+/// Classify a **Streamable HTTP** response during era detection.
+///
+/// The status code changes what the body means, so classifying on the body
+/// alone gets legacy servers wrong:
+///
+/// * **2xx** — the modern request was accepted. Modern.
+/// * **400** — both eras use it. Only a recognised modern error code
+///   ([`classify_http_error_body`]) proves modern.
+/// * **404 / 405** — a modern server answers an unknown method with `404` and a
+///   JSON-RPC `-32601` body, and rejects `GET`/`DELETE` with `405`. A legacy
+///   HTTP+SSE server that does not host a modern endpoint also answers `404` —
+///   but with no JSON-RPC body. So here the *presence* of a JSON-RPC error body
+///   is what distinguishes them, not the specific code: `-32601` means "modern
+///   server, no such method", which is nothing like it means on a `400`.
+/// * **anything else** — `401`, `403`, `429`, `5xx` and friends say nothing
+///   about which protocol the peer speaks. [`Detection::Undetermined`], so the
+///   caller surfaces the real error instead of mislabelling the server's era
+///   and caching it.
+///
+/// Every status maps to one of the three outcomes; none is a failure. Falling
+/// back to the legacy lifecycle is always available, which is what keeps a
+/// dual-era client working against a legacy server.
+pub fn classify_http_response(status: u16, body: &str) -> Detection {
+    match status {
+        200..=299 => Detection::Modern,
+        400 => classify_http_error_body(body),
+        404 | 405 => {
+            if is_jsonrpc_error_body(body) {
+                Detection::Modern
+            } else {
+                Detection::Legacy
+            }
+        }
+        _ => Detection::Undetermined,
+    }
+}
+
+/// Whether the body is a JSON-RPC error response (or a batch containing one).
+///
+/// Used only for `404`/`405`, where any JSON-RPC error shape means a modern
+/// endpoint answered, versus a bare HTML or empty body from a server that has
+/// no modern endpoint at all.
+fn is_jsonrpc_error_body(body: &str) -> bool {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| error_code_of(&v))
+        .is_some()
+}
+
 /// Pull a JSON-RPC error code out of a response body, looking inside batches.
 fn error_code_of(value: &Value) -> Option<i64> {
     match value {
@@ -199,6 +248,81 @@ mod tests {
     }
 
     // --- Streamable HTTP --------------------------------------------------
+
+    // --- status-aware classification --------------------------------------
+
+    #[test]
+    fn success_is_modern() {
+        for status in [200, 201, 202, 204, 299] {
+            assert_eq!(classify_http_response(status, ""), Detection::Modern);
+        }
+    }
+
+    #[test]
+    fn method_not_found_flips_meaning_between_400_and_404() {
+        // The case the body-only classifier got wrong. A modern server answers
+        // an unknown method with 404 + -32601; on a 400, -32601 says nothing
+        // about era. Same body, opposite conclusion.
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "error": {"code": METHOD_NOT_FOUND, "message": "no such method"}
+        })
+        .to_string();
+
+        assert_eq!(classify_http_response(400, &body), Detection::Legacy);
+        assert_eq!(classify_http_response(404, &body), Detection::Modern);
+    }
+
+    #[test]
+    fn bare_404_and_405_fall_back_to_legacy() {
+        // A legacy HTTP+SSE server with no modern endpoint: no JSON-RPC body.
+        // This must fall back, never fail — it is the path that keeps a
+        // dual-era client working against a legacy deployment.
+        for status in [404, 405] {
+            for body in ["", "<html>404 Not Found</html>", "Not Found", "null"] {
+                assert_eq!(
+                    classify_http_response(status, body),
+                    Detection::Legacy,
+                    "status {status} body {body:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn transport_and_auth_statuses_stay_undetermined() {
+        // 401/403 mean "authenticate", 5xx mean "the server is unwell". Reading
+        // either as an era would cache the wrong answer for the endpoint and
+        // hide the actual error from the caller.
+        for status in [401, 403, 407, 429, 500, 502, 503, 504] {
+            assert_eq!(
+                classify_http_response(status, ""),
+                Detection::Undetermined,
+                "status {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_status_ever_produces_a_hard_failure() {
+        // Legacy safety, stated as an invariant: whatever a server returns,
+        // detection yields one of the three outcomes. A dual-era client always
+        // has a fallback available and never aborts on era grounds.
+        for status in [100, 200, 301, 400, 401, 404, 405, 418, 500, 599] {
+            let d = classify_http_response(status, "");
+            assert!(
+                matches!(
+                    d,
+                    Detection::Modern | Detection::Legacy | Detection::Undetermined
+                ),
+                "status {status}"
+            );
+            // And only conclusive outcomes are ever cached.
+            if !d.is_conclusive() {
+                assert_eq!(d, Detection::Undetermined, "status {status}");
+            }
+        }
+    }
 
     #[test]
     fn http_400_with_a_modern_code_is_modern() {

@@ -284,6 +284,21 @@ impl McpError {
         }
     }
 
+    /// The `data` member of the underlying JSON-RPC error, if any.
+    ///
+    /// Protocol errors carry their actionable detail here — the `supported`
+    /// version list on `-32022`, `requiredCapabilities` on `-32021` — so a
+    /// client can recover instead of only reporting failure.
+    pub fn data(&self) -> Option<&Value> {
+        match self {
+            McpError::Retryable { data, .. }
+            | McpError::NonRetryable { data, .. }
+            | McpError::Protocol { data, .. }
+            | McpError::Validation { data, .. } => data.as_ref(),
+            _ => None,
+        }
+    }
+
     /// Whether this error positively identifies the peer as speaking the
     /// 2026-era protocol. See [`MODERN_PROTOCOL_ERRORS`].
     pub fn is_modern_protocol_error(&self) -> bool {
@@ -394,6 +409,56 @@ mod tests {
         }
         assert!(!is_modern_protocol_error(METHOD_NOT_FOUND));
         assert!(!is_modern_protocol_error(MCP_PROTOCOL_VERSION_MISMATCH));
+    }
+
+    #[test]
+    fn data_is_readable_from_every_carrying_variant() {
+        // Protocol errors put their recoverable detail in `data` — the
+        // `supported` list on -32022, `requiredCapabilities` on -32021 — so
+        // every variant that can carry it must expose it.
+        let payload = serde_json::json!({"supported": ["2026-07-28"]});
+
+        let carriers = [
+            McpError::Retryable {
+                code: INTERNAL_ERROR,
+                message: "x".into(),
+                data: Some(payload.clone()),
+            },
+            McpError::NonRetryable {
+                code: UNSUPPORTED_PROTOCOL_VERSION,
+                message: "x".into(),
+                data: Some(payload.clone()),
+            },
+            McpError::Protocol {
+                code: PARSE_ERROR,
+                message: "x".into(),
+                data: Some(payload.clone()),
+            },
+            McpError::Validation {
+                code: INVALID_PARAMS,
+                message: "x".into(),
+                data: Some(payload.clone()),
+            },
+        ];
+        for err in &carriers {
+            assert_eq!(err.data(), Some(&payload), "{err}");
+        }
+
+        // Variants with no JSON-RPC data, and a carrier with data absent.
+        assert!(McpError::Timeout(std::time::Duration::from_secs(1))
+            .data()
+            .is_none());
+        assert!(McpError::Transport("closed".into()).data().is_none());
+        assert!(McpError::Cancelled("id".into()).data().is_none());
+        assert!(McpError::VersionMismatch {
+            requested: "a".into(),
+            supported: vec!["b".into()],
+        }
+        .data()
+        .is_none());
+        assert!(McpError::from_json_rpc(INTERNAL_ERROR, "x", None)
+            .data()
+            .is_none());
     }
 
     #[test]
