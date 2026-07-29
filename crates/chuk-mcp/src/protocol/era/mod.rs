@@ -265,6 +265,26 @@ mod tests {
     use std::str::FromStr;
 
     #[test]
+    fn era_predicates_and_display() {
+        assert!(ProtocolEra::Modern.is_modern());
+        assert!(!ProtocolEra::Modern.is_legacy());
+        assert!(ProtocolEra::Legacy.is_legacy());
+        assert!(!ProtocolEra::Legacy.is_modern());
+
+        // Display is the configuration spelling, not a debug label.
+        assert_eq!(ProtocolEra::Legacy.to_string(), "legacy");
+        assert_eq!(ProtocolEra::Modern.to_string(), "2026-07-28");
+        assert_eq!(EraMode::Auto.to_string(), "auto");
+        assert_eq!(EraMode::Legacy.to_string(), "legacy");
+        assert_eq!(EraMode::Modern.to_string(), "2026-07-28");
+
+        // ...so it must round-trip back through FromStr.
+        for mode in [EraMode::Auto, EraMode::Legacy, EraMode::Modern] {
+            assert_eq!(EraMode::from_str(&mode.to_string()).unwrap(), mode);
+        }
+    }
+
+    #[test]
     fn era_from_version() {
         assert_eq!(
             ProtocolEra::from_protocol_version("2026-07-28"),

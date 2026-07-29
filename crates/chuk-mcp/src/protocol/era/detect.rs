@@ -131,6 +131,24 @@ mod tests {
     }
 
     #[test]
+    fn probe_result_delegates_failures() {
+        // The wrapper must forward errors to classify_probe_error rather than
+        // treating any non-Ok probe as a single outcome.
+        assert_eq!(
+            classify_probe_result(&Err(rpc(METHOD_NOT_FOUND))),
+            Detection::Legacy
+        );
+        assert_eq!(
+            classify_probe_result(&Err(rpc(UNSUPPORTED_PROTOCOL_VERSION))),
+            Detection::Modern
+        );
+        assert_eq!(
+            classify_probe_result(&Err(McpError::Timeout(Duration::from_secs(1)))),
+            Detection::Undetermined
+        );
+    }
+
+    #[test]
     fn probe_rejection_with_a_modern_code_is_still_modern() {
         // The subtle one: these are rejections, but only a modern server can
         // produce them, so they identify the era just as well as a success.

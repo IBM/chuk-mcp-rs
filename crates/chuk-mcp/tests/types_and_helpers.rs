@@ -99,8 +99,13 @@ fn error_helpers_and_type() {
         MCP_PROMPT_NOT_FOUND,
         MCP_AUTHORIZATION_FAILED,
         MCP_PROTOCOL_VERSION_MISMATCH,
+        HEADER_MISMATCH,
+        MISSING_REQUIRED_CLIENT_CAPABILITY,
+        UNSUPPORTED_PROTOCOL_VERSION,
     ] {
         assert!(!get_error_message(code).is_empty());
+        // No code may fall through to the unknown-code formatter.
+        assert!(!get_error_message(code).contains("Unknown"));
     }
     assert!(get_error_message(12345).contains("Unknown"));
 
