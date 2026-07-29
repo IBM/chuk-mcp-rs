@@ -1,6 +1,10 @@
 /target
 Cargo.lock.bak
 
+# Coverage artifacts (see .github/workflows/ci.yml)
+coverage.json
+*.profraw
+
 # Python / maturin build artifacts
 *.so
 *.pyd
