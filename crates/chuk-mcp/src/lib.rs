@@ -29,6 +29,7 @@ pub mod server;
 pub mod transports;
 
 pub use client::{connect_to_server, McpClient};
+pub use protocol::era::{Detection, EndpointKey, EraCache, EraMode, ProtocolEra, ServerProfile};
 pub use protocol::json_rpc::JsonRpcMessage;
 pub use protocol::types::capabilities::{ClientCapabilities, ServerCapabilities};
 pub use protocol::types::errors::McpError;

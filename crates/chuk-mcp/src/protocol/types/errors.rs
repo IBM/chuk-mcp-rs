@@ -27,6 +27,43 @@ pub const MCP_PROMPT_NOT_FOUND: i64 = -32006;
 pub const MCP_AUTHORIZATION_FAILED: i64 = -32007;
 pub const MCP_PROTOCOL_VERSION_MISMATCH: i64 = -32008;
 
+// ---------------------------------------------------------------------------
+// Specification-reserved error codes (2026-07-28).
+//
+// The 2026-07-28 revision partitions the JSON-RPC server-error range: -32000 to
+// -32019 stays implementation-defined, with existing SDK usage grandfathered —
+// which is why every code above keeps its value — and -32020 to -32099 is
+// reserved for the specification itself.
+// ---------------------------------------------------------------------------
+
+/// Start (high end) of the specification-reserved sub-range.
+pub const MCP_SPEC_ERROR_START: i64 = -32020;
+/// End (low end) of the specification-reserved sub-range.
+pub const MCP_SPEC_ERROR_END: i64 = -32099;
+
+/// The request's headers and body disagree — e.g. `Mcp-Method` names a
+/// different method than the JSON-RPC body.
+pub const HEADER_MISMATCH: i64 = -32020;
+/// The server requires a client capability the request did not declare.
+pub const MISSING_REQUIRED_CLIENT_CAPABILITY: i64 = -32021;
+/// The server does not support the protocol version the request declared.
+pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+
+/// Codes that positively identify a peer as speaking the 2026-era protocol.
+///
+/// Receiving one of these is evidence of a *modern* server even though it is a
+/// rejection: a legacy server has no way to produce them, and answers an
+/// unknown method with [`METHOD_NOT_FOUND`] instead.
+pub const MODERN_PROTOCOL_ERRORS: &[i64] = &[
+    HEADER_MISMATCH,
+    MISSING_REQUIRED_CLIENT_CAPABILITY,
+    UNSUPPORTED_PROTOCOL_VERSION,
+];
+
+/// Resource-not-found under 2026-07-28, which aligns it with JSON-RPC
+/// `Invalid Params`. Legacy peers use [`MCP_RESOURCE_NOT_FOUND`] instead.
+pub const MODERN_RESOURCE_NOT_FOUND: i64 = INVALID_PARAMS;
+
 /// Errors that are permanent and should not be retried.
 pub const NON_RETRYABLE_ERRORS: &[i64] = &[
     PARSE_ERROR,
@@ -39,6 +76,13 @@ pub const NON_RETRYABLE_ERRORS: &[i64] = &[
     MCP_AUTHORIZATION_FAILED,
     MCP_PROTOCOL_VERSION_MISMATCH,
     CONNECTION_CLOSED,
+    // Protocol-level rejections. These must never be retried: unknown codes
+    // default to retryable, so omitting them would make a client silently
+    // re-send a request the server has already refused on protocol grounds —
+    // and would stop UNSUPPORTED_PROTOCOL_VERSION from triggering re-detection.
+    HEADER_MISMATCH,
+    MISSING_REQUIRED_CLIENT_CAPABILITY,
+    UNSUPPORTED_PROTOCOL_VERSION,
 ];
 
 /// Errors that might be transient and worth retrying.
@@ -68,6 +112,11 @@ pub fn get_error_message(code: i64) -> String {
         MCP_PROMPT_NOT_FOUND => "Requested prompt was not found".into(),
         MCP_AUTHORIZATION_FAILED => "Authorization failed".into(),
         MCP_PROTOCOL_VERSION_MISMATCH => "Protocol version mismatch".into(),
+        HEADER_MISMATCH => "Request headers do not match the request body".into(),
+        MISSING_REQUIRED_CLIENT_CAPABILITY => {
+            "Request omitted a client capability the server requires".into()
+        }
+        UNSUPPORTED_PROTOCOL_VERSION => "Unsupported protocol version".into(),
         other => format!("Unknown error: Code {other}"),
     }
 }
@@ -101,7 +150,22 @@ pub fn is_mcp_specific_error(code: i64) -> bool {
             | MCP_PROMPT_NOT_FOUND
             | MCP_AUTHORIZATION_FAILED
             | MCP_PROTOCOL_VERSION_MISMATCH
+            | HEADER_MISMATCH
+            | MISSING_REQUIRED_CLIENT_CAPABILITY
+            | UNSUPPORTED_PROTOCOL_VERSION
     )
+}
+
+/// Whether the code positively identifies a peer as speaking the 2026-era
+/// protocol. See [`MODERN_PROTOCOL_ERRORS`].
+pub fn is_modern_protocol_error(code: i64) -> bool {
+    MODERN_PROTOCOL_ERRORS.contains(&code)
+}
+
+/// Whether the code lies in the specification-reserved sub-range
+/// (`-32099..=-32020`).
+pub fn is_spec_reserved_error(code: i64) -> bool {
+    (MCP_SPEC_ERROR_END..=MCP_SPEC_ERROR_START).contains(&code)
 }
 
 /// The library-wide error type. Plays the role of the Python package's
@@ -220,6 +284,24 @@ impl McpError {
         }
     }
 
+    /// Whether this error positively identifies the peer as speaking the
+    /// 2026-era protocol. See [`MODERN_PROTOCOL_ERRORS`].
+    pub fn is_modern_protocol_error(&self) -> bool {
+        self.code().map(is_modern_protocol_error).unwrap_or(false)
+    }
+
+    /// Whether this error means a cached era decision for the peer is stale and
+    /// must be re-detected.
+    ///
+    /// Only [`UNSUPPORTED_PROTOCOL_VERSION`] qualifies: it is the server saying
+    /// the version we chose for it is wrong, which is exactly what happens when
+    /// a server is upgraded (or rolled back) underneath a running client. A
+    /// legacy [`McpError::VersionMismatch`] does *not* qualify — that is
+    /// ordinary handshake negotiation, not an era change.
+    pub fn invalidates_era(&self) -> bool {
+        self.code() == Some(UNSUPPORTED_PROTOCOL_VERSION)
+    }
+
     /// Whether this error is worth retrying.
     pub fn is_retryable(&self) -> bool {
         match self {
@@ -273,5 +355,64 @@ mod tests {
         assert!(!is_server_error(-31999));
         assert!(is_standard_jsonrpc_error(PARSE_ERROR));
         assert!(is_mcp_specific_error(MCP_TOOL_NOT_FOUND));
+    }
+
+    #[test]
+    fn legacy_codes_are_grandfathered_outside_the_reserved_range() {
+        // The 2026-07-28 allocation policy reserves -32020..=-32099 for the
+        // specification and grandfathers implementation codes in
+        // -32000..=-32019. Every pre-existing code must stay in the
+        // implementation half, or it would collide with a future spec code.
+        for code in [
+            CONNECTION_CLOSED,
+            REQUEST_TIMEOUT,
+            MCP_INITIALIZATION_FAILED,
+            MCP_CAPABILITY_NOT_SUPPORTED,
+            MCP_RESOURCE_NOT_FOUND,
+            MCP_TOOL_NOT_FOUND,
+            MCP_PROMPT_NOT_FOUND,
+            MCP_AUTHORIZATION_FAILED,
+            MCP_PROTOCOL_VERSION_MISMATCH,
+        ] {
+            assert!(
+                !is_spec_reserved_error(code),
+                "code {code} collides with the specification-reserved range"
+            );
+        }
+    }
+
+    #[test]
+    fn modern_codes_are_reserved_and_non_retryable() {
+        for code in MODERN_PROTOCOL_ERRORS {
+            assert!(is_spec_reserved_error(*code));
+            assert!(is_modern_protocol_error(*code));
+            // Unknown codes default to retryable — these must not.
+            assert!(
+                !is_retryable_error(*code),
+                "code {code} must not be retried"
+            );
+        }
+        assert!(!is_modern_protocol_error(METHOD_NOT_FOUND));
+        assert!(!is_modern_protocol_error(MCP_PROTOCOL_VERSION_MISMATCH));
+    }
+
+    #[test]
+    fn only_unsupported_version_invalidates_the_era() {
+        let unsupported = McpError::from_json_rpc(UNSUPPORTED_PROTOCOL_VERSION, "nope", None);
+        assert!(unsupported.invalidates_era());
+        assert!(unsupported.is_modern_protocol_error());
+        assert!(!unsupported.is_retryable());
+
+        let header = McpError::from_json_rpc(HEADER_MISMATCH, "nope", None);
+        assert!(!header.invalidates_era());
+        assert!(header.is_modern_protocol_error());
+
+        // Legacy handshake negotiation is not an era change.
+        let legacy = McpError::VersionMismatch {
+            requested: "2025-06-18".into(),
+            supported: vec!["2024-11-05".into()],
+        };
+        assert!(!legacy.invalidates_era());
+        assert!(!legacy.is_modern_protocol_error());
     }
 }

@@ -13,7 +13,7 @@ use crate::protocol::messages::send_message::{
 use crate::protocol::types::capabilities::{ClientCapabilities, ServerCapabilities};
 use crate::protocol::types::errors::{McpError, INVALID_PARAMS};
 use crate::protocol::types::info::{ClientInfo, ServerInfo};
-use crate::protocol::versioning::SUPPORTED_VERSIONS;
+use crate::protocol::versioning::{LEGACY_VERSIONS, SUPPORTED_VERSIONS};
 
 /// Parameters for the `initialize` request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -47,7 +47,8 @@ pub struct InitializeOptions {
     /// Timeout for the handshake (default 60s).
     pub timeout: Option<std::time::Duration>,
     /// Supported protocol versions, preferred first. Defaults to
-    /// [`SUPPORTED_VERSIONS`].
+    /// [`LEGACY_VERSIONS`] — not [`SUPPORTED_VERSIONS`]; see
+    /// [`send_initialize_with_options`].
     pub supported_versions: Option<Vec<String>>,
     /// Preferred protocol version to propose.
     pub preferred_version: Option<String>,
@@ -71,6 +72,12 @@ pub async fn send_initialize(
 }
 
 /// [`send_initialize`] with explicit version negotiation options.
+///
+/// Defaults to offering [`LEGACY_VERSIONS`], **not** [`SUPPORTED_VERSIONS`].
+/// `initialize` does not exist in the 2026-era protocol, so reaching this
+/// function at all means the peer is legacy; proposing a modern version here
+/// would ask a legacy server for a revision it has never heard of, and it would
+/// reject the handshake outright.
 pub async fn send_initialize_with_options(
     read_stream: &ReadStream,
     write_stream: &WriteStream,
@@ -78,7 +85,7 @@ pub async fn send_initialize_with_options(
 ) -> Result<InitializeResult, McpError> {
     let supported_versions: Vec<String> = options
         .supported_versions
-        .unwrap_or_else(|| SUPPORTED_VERSIONS.iter().map(|v| v.to_string()).collect());
+        .unwrap_or_else(|| LEGACY_VERSIONS.iter().map(|v| v.to_string()).collect());
 
     let proposed_version = options
         .preferred_version
@@ -180,14 +187,16 @@ mod tests {
         let request = sent.recv().await.unwrap();
         assert_eq!(request.method(), Some("initialize"));
         let params = request.params().unwrap();
-        assert_eq!(params["protocolVersion"], SUPPORTED_VERSIONS[0]);
+        // The handshake must propose a legacy version, never the modern one.
+        assert_eq!(params["protocolVersion"], LEGACY_VERSIONS[0]);
+        assert_ne!(params["protocolVersion"], SUPPORTED_VERSIONS[0]);
         assert_eq!(params["clientInfo"]["name"], "chuk-mcp-client");
 
         inject
             .send(JsonRpcMessage::Response(create_response(
                 request.id().unwrap().clone(),
                 Some(json!({
-                    "protocolVersion": SUPPORTED_VERSIONS[0],
+                    "protocolVersion": LEGACY_VERSIONS[0],
                     "serverInfo": {"name": "test-server", "version": "1.0"},
                     "capabilities": {"tools": {}},
                 })),

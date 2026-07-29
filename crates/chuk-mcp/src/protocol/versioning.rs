@@ -2,14 +2,38 @@
 
 use crate::protocol::types::errors::McpError;
 
-/// Supported protocol versions (newest first).
-pub const SUPPORTED_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+/// The stateless revision: no `initialize` handshake, no protocol sessions,
+/// per-request `_meta`, and multi round-trip results.
+pub const V2026_07_28: &str = "2026-07-28";
+pub const V2025_06_18: &str = "2025-06-18";
+pub const V2025_03_26: &str = "2025-03-26";
+pub const V2024_11_05: &str = "2024-11-05";
+
+/// Every protocol version this library supports (newest first).
+pub const SUPPORTED_VERSIONS: &[&str] = &[V2026_07_28, V2025_06_18, V2025_03_26, V2024_11_05];
+
+/// The versions that use the legacy stateful lifecycle (newest first).
+///
+/// This — **not** [`SUPPORTED_VERSIONS`] — is what the `initialize` handshake
+/// offers. `initialize` does not exist in the 2026-era protocol, so proposing a
+/// modern version through it would ask a legacy server for a version it has
+/// never heard of.
+///
+/// `2025-11-25` is deliberately absent: it is not supported (see the migration
+/// design note). Servers speaking it negotiate down to `2025-06-18`.
+pub const LEGACY_VERSIONS: &[&str] = &[V2025_06_18, V2025_03_26, V2024_11_05];
 
 /// The current/latest supported MCP protocol version.
-pub const CURRENT_VERSION: &str = SUPPORTED_VERSIONS[0];
+pub const CURRENT_VERSION: &str = V2026_07_28;
 
 /// The minimum supported MCP protocol version.
-pub const MINIMUM_VERSION: &str = SUPPORTED_VERSIONS[2];
+pub const MINIMUM_VERSION: &str = V2024_11_05;
+
+/// The first revision using the stateless protocol.
+pub const FIRST_MODERN_VERSION: &str = V2026_07_28;
+
+/// The newest revision still using the legacy stateful lifecycle.
+pub const LATEST_LEGACY_VERSION: &str = V2025_06_18;
 
 /// Validate that a version follows MCP format (YYYY-MM-DD).
 pub fn validate_format(version: &str) -> bool {
@@ -26,6 +50,15 @@ pub fn validate_format(version: &str) -> bool {
 /// Check if a version is in the supported versions list.
 pub fn is_supported(version: &str) -> bool {
     SUPPORTED_VERSIONS.contains(&version)
+}
+
+/// Whether `version` uses the stateless 2026-era protocol.
+///
+/// Classification is by date, not by membership of [`SUPPORTED_VERSIONS`], so a
+/// well-formed future revision is treated as modern rather than as legacy. A
+/// malformed string is not modern.
+pub fn is_modern_version(version: &str) -> bool {
+    validate_format(version) && version >= FIRST_MODERN_VERSION
 }
 
 /// Parse a version string into (year, month, day).
@@ -111,5 +144,42 @@ mod tests {
         let v = negotiate_version(&["2025-06-18", "2025-03-26"], &["2025-03-26"]).unwrap();
         assert_eq!(v, "2025-03-26");
         assert!(negotiate_version(&["2025-06-18"], &["2019-01-01"]).is_err());
+    }
+
+    #[test]
+    fn current_version_is_the_stateless_revision() {
+        assert_eq!(CURRENT_VERSION, "2026-07-28");
+        assert_eq!(SUPPORTED_VERSIONS[0], CURRENT_VERSION);
+        assert_eq!(MINIMUM_VERSION, "2024-11-05");
+        assert!(SUPPORTED_VERSIONS.iter().all(|v| validate_format(v)));
+    }
+
+    #[test]
+    fn legacy_versions_exclude_the_modern_revision() {
+        // The `initialize` handshake offers this list. A modern version leaking
+        // into it would be proposed to legacy servers, which would reject it.
+        assert!(!LEGACY_VERSIONS.contains(&FIRST_MODERN_VERSION));
+        assert!(LEGACY_VERSIONS.iter().all(|v| !is_modern_version(v)));
+        assert_eq!(LEGACY_VERSIONS[0], LATEST_LEGACY_VERSION);
+        // Every legacy version is still supported overall.
+        assert!(LEGACY_VERSIONS.iter().all(|v| is_supported(v)));
+    }
+
+    #[test]
+    fn modern_classification() {
+        assert!(is_modern_version("2026-07-28"));
+        assert!(is_modern_version("2027-01-01"));
+        assert!(!is_modern_version("2025-06-18"));
+        assert!(!is_modern_version("2024-11-05"));
+        assert!(!is_modern_version("garbage"));
+        assert!(!is_modern_version(""));
+    }
+
+    #[test]
+    fn unsupported_2025_11_25_still_classifies_as_legacy() {
+        // We deliberately do not support this revision, but if one is ever seen
+        // on the wire it must not be mistaken for the stateless protocol.
+        assert!(!is_supported("2025-11-25"));
+        assert!(!is_modern_version("2025-11-25"));
     }
 }
