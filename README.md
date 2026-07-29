@@ -19,9 +19,16 @@ by Rust.
 
 Full-parity port of the Python package's public surface:
 
-- **Protocol layer** — JSON-RPC 2.0 messages (request/notification/response/error + batches), MCP types (content, capabilities, tools, info, elicitation), version negotiation (`2025-06-18` / `2025-03-26` / `2024-11-05`), and version-gated batching.
+- **Protocol layer** — JSON-RPC 2.0 messages (request/notification/response/error + batches), MCP types (content, capabilities, tools, info, elicitation), version negotiation across both protocol eras (`2026-07-28` / `2025-06-18` / `2025-03-26` / `2024-11-05`), and version-gated batching.
 - **Message layer** — `initialize`, `tools/*`, `resources/*`, `prompts/*`, `ping`, `logging/setLevel`, `completion/complete`, `sampling/createMessage`, `roots/*`, and all notifications, with cancellation and progress support in `send_message`.
-- **Transports** — stdio (subprocess), Streamable HTTP (2025-03-26), and the legacy SSE transport.
+- **Transports** — stdio (subprocess), Streamable HTTP in both shapes — stateless
+  `2026-07-28` and the legacy stateful revision, with a dual-era transport that
+  picks between them — and the deprecated HTTP+SSE transport.
+- **2026-07-28 support** — per-request `_meta`, the mirrored `MCP-Protocol-Version`
+  / `Mcp-Method` / `Mcp-Name` headers, `x-mcp-header` parameter promotion,
+  `server/discover`, era detection and caching, and new-request-ID retry on a
+  broken response stream. See `ROADMAP.md` in the `chuk-mcp` repo for what is
+  still outstanding (typed results, MRTR, catalogue caching).
 - **Client** — high-level `McpClient` (initialize / list & call tools / read resources / get prompts / ping).
 - **Server** — `McpServer` with tool/resource registration, a protocol handler, and in-memory sessions.
 

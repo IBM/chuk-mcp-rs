@@ -16,7 +16,8 @@ through PyO3 bindings.
 
 - **Protocol** — JSON-RPC 2.0 (requests, notifications, responses, errors,
   batches), the MCP type system (content, capabilities, tools, info,
-  elicitation), version negotiation (`2025-06-18` / `2025-03-26` / `2024-11-05`),
+  elicitation), version negotiation across both protocol eras (`2026-07-28` /
+  `2025-06-18` / `2025-03-26` / `2024-11-05`),
   and version-gated batching.
 - **Messages** — `initialize`, `tools/*`, `resources/*`, `prompts/*`, `ping`,
   `logging/setLevel`, `completion/complete`, `sampling/createMessage`,
