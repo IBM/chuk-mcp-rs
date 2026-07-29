@@ -33,6 +33,7 @@ pub use protocol::envelope::{build_envelope, ClientIdentity, Envelope};
 pub use protocol::era::{
     renegotiate, Detection, EndpointKey, EraCache, EraMode, ProtocolEra, ServerProfile,
 };
+pub use protocol::header_params::HeaderParam;
 pub use protocol::json_rpc::JsonRpcMessage;
 pub use protocol::meta::RequestMeta;
 pub use protocol::types::capabilities::{ClientCapabilities, ServerCapabilities};

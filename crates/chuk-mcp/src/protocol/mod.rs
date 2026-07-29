@@ -4,6 +4,7 @@
 pub mod envelope;
 pub mod era;
 pub mod features;
+pub mod header_params;
 pub mod json_rpc;
 pub mod messages;
 pub mod meta;

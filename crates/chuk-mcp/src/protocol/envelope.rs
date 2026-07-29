@@ -20,6 +20,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use serde_json::{Map, Value};
 
+use crate::protocol::header_params;
 use crate::protocol::messages::method::MessageMethod;
 use crate::protocol::meta::RequestMeta;
 use crate::protocol::types::capabilities::ClientCapabilities;
@@ -110,6 +111,23 @@ impl Envelope {
             (None, None) => true,
             _ => false,
         }
+    }
+
+    /// Promote a tool's `x-mcp-header` parameters onto this envelope.
+    ///
+    /// Fails if the tool definition violates the `x-mcp-header` constraints. The
+    /// caller should then exclude that one tool from `tools/list` rather than
+    /// failing the whole listing — see [`crate::protocol::header_params`].
+    pub fn promote_tool_params(
+        &mut self,
+        input_schema: &Value,
+        arguments: &Value,
+    ) -> Result<(), McpError> {
+        let declared = header_params::collect(input_schema)?;
+        for (name, value) in header_params::extract(&declared, arguments)? {
+            self.push_param_header(&name, &value);
+        }
+        Ok(())
     }
 
     /// Whether any header carries a protocol session id.
@@ -486,6 +504,59 @@ mod tests {
         );
         // Promoted headers do not disturb the mirrored ones.
         assert!(env.headers_match_body());
+    }
+
+    #[test]
+    fn promotes_the_specification_execute_sql_example() {
+        // The spec's worked example, end to end: schema + arguments in, the
+        // exact documented header set out.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "region": {"type": "string", "x-mcp-header": "Region"},
+                "query": {"type": "string"}
+            },
+            "required": ["region", "query"]
+        });
+        let arguments = json!({"region": "us-west1", "query": "SELECT * FROM users"});
+
+        let mut env = build(
+            "tools/call",
+            json!({"name": "execute_sql", "arguments": arguments.clone()}),
+        );
+        env.promote_tool_params(&schema, &arguments).unwrap();
+
+        assert_eq!(env.header(HEADER_PROTOCOL_VERSION), Some("2026-07-28"));
+        assert_eq!(env.header(HEADER_METHOD), Some("tools/call"));
+        assert_eq!(env.header(HEADER_NAME), Some("execute_sql"));
+        assert_eq!(env.header("Mcp-Param-Region"), Some("us-west1"));
+        // `query` was not annotated, so it stays in the body only.
+        assert!(env.header("Mcp-Param-Query").is_none());
+        assert!(env.headers_match_body());
+        assert!(!env.has_session_header());
+    }
+
+    #[test]
+    fn promotion_rejects_an_invalid_tool_definition() {
+        // The caller uses this to drop one tool from tools/list rather than
+        // failing the whole listing.
+        let mut env = build("tools/call", json!({"name": "bad"}));
+        let bad_schema = json!({
+            "properties": {"p": {"type": "number", "x-mcp-header": "P"}}
+        });
+        assert!(env
+            .promote_tool_params(&bad_schema, &json!({"p": 1}))
+            .is_err());
+
+        // An unannotated schema promotes nothing and succeeds.
+        let mut env = build("tools/call", json!({"name": "plain"}));
+        let before = env.headers.len();
+        env.promote_tool_params(
+            &json!({"properties": {"p": {"type": "string"}}}),
+            &json!({"p": "x"}),
+        )
+        .unwrap();
+        assert_eq!(env.headers.len(), before);
     }
 
     #[test]
