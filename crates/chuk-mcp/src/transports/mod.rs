@@ -6,6 +6,7 @@ pub mod http_modern;
 pub mod limits;
 pub mod sse;
 pub mod stdio;
+pub mod stdio_dual;
 
 use async_trait::async_trait;
 

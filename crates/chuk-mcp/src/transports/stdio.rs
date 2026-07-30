@@ -13,6 +13,7 @@ use tokio::sync::{mpsc, Mutex};
 use crate::protocol::features::batching::BatchProcessor;
 use crate::protocol::json_rpc::parse_message_str;
 use crate::protocol::messages::send_message::{message_channel, ReadStream, WriteStream};
+use crate::protocol::meta::RequestMeta;
 use crate::protocol::types::errors::McpError;
 use crate::transports::limits::{read_line_bounded, TransportLimits};
 use crate::transports::Transport;
@@ -79,6 +80,12 @@ impl StdioParameters {
 
 /// Stdio transport speaking newline-delimited JSON-RPC with a subprocess.
 pub struct StdioTransport {
+    /// When set, every outgoing request has this `_meta` merged into its params.
+    ///
+    /// stdio is one pipe shared by both eras, so unlike HTTP there is no
+    /// separate transport to switch to — era shows up purely as message shape.
+    /// `None` means the legacy lifecycle, where `_meta` would be unexpected.
+    modern_meta: Arc<std::sync::Mutex<Option<RequestMeta>>>,
     incoming: ReadStream,
     outgoing: WriteStream,
     child: Arc<Mutex<Option<Child>>>,
@@ -226,9 +233,18 @@ impl StdioTransport {
         });
 
         // stdin writer: serialize outbound messages as JSON lines.
+        let modern_meta: Arc<std::sync::Mutex<Option<RequestMeta>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let meta_for_writer = modern_meta.clone();
         let writer = tokio::spawn(async move {
             let mut stdin = stdin;
             while let Some(message) = outgoing_rx.recv().await {
+                // Injecting here rather than at each call site means no `send_*`
+                // helper can omit metadata the modern protocol requires.
+                let message = match meta_for_writer.lock().expect("meta lock").as_ref() {
+                    Some(meta) => inject_meta(message, meta),
+                    None => message,
+                };
                 let mut json = message.to_json();
                 json.push('\n');
                 if let Err(e) = stdin.write_all(json.as_bytes()).await {
@@ -247,12 +263,31 @@ impl StdioTransport {
         });
 
         Ok(StdioTransport {
+            modern_meta,
             incoming,
             outgoing,
             child: Arc::new(Mutex::new(Some(child))),
             batch_processor,
             tasks: vec![reader, writer],
         })
+    }
+
+    /// Send every subsequent request with this per-request `_meta`.
+    ///
+    /// Called once the peer is known to speak the modern protocol. Applies to
+    /// requests only: notifications and responses are left alone.
+    pub fn set_modern_meta(&self, meta: RequestMeta) {
+        *self.modern_meta.lock().expect("meta lock") = Some(meta);
+    }
+
+    /// Stop injecting `_meta` — the peer turned out to be legacy.
+    pub fn clear_modern_meta(&self) {
+        *self.modern_meta.lock().expect("meta lock") = None;
+    }
+
+    /// Whether outgoing requests currently carry modern `_meta`.
+    pub fn is_modern(&self) -> bool {
+        self.modern_meta.lock().expect("meta lock").is_some()
     }
 
     /// The negotiated protocol version, if set.
@@ -356,6 +391,32 @@ pub async fn stdio_client(
     let transport = StdioTransport::start(parameters).await?;
     let (read, write) = transport.get_streams().await?;
     Ok((transport, read, write))
+}
+
+/// Merge a `_meta` block into an outgoing request's params.
+///
+/// Requests only. A notification carries no id and expects no reply, and a
+/// response is the peer's shape to define.
+fn inject_meta(
+    message: crate::protocol::json_rpc::JsonRpcMessage,
+    meta: &RequestMeta,
+) -> crate::protocol::json_rpc::JsonRpcMessage {
+    use crate::protocol::json_rpc::JsonRpcMessage;
+    use serde_json::{Map, Value};
+
+    let JsonRpcMessage::Request(mut request) = message else {
+        return message;
+    };
+    let Ok(rendered) = meta.to_map() else {
+        return JsonRpcMessage::Request(request);
+    };
+    let mut params = match request.params.take() {
+        Some(Value::Object(map)) => map,
+        _ => Map::new(),
+    };
+    params.insert("_meta".to_string(), Value::Object(rendered));
+    request.params = Some(Value::Object(params));
+    JsonRpcMessage::Request(request)
 }
 
 /// Convenience: start a stdio transport and perform initialization, like the
