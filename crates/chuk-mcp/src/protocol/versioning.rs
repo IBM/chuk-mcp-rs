@@ -5,12 +5,19 @@ use crate::protocol::types::errors::McpError;
 /// The stateless revision: no `initialize` handshake, no protocol sessions,
 /// per-request `_meta`, and multi round-trip results.
 pub const V2026_07_28: &str = "2026-07-28";
+pub const V2025_11_25: &str = "2025-11-25";
 pub const V2025_06_18: &str = "2025-06-18";
 pub const V2025_03_26: &str = "2025-03-26";
 pub const V2024_11_05: &str = "2024-11-05";
 
 /// Every protocol version this library supports (newest first).
-pub const SUPPORTED_VERSIONS: &[&str] = &[V2026_07_28, V2025_06_18, V2025_03_26, V2024_11_05];
+pub const SUPPORTED_VERSIONS: &[&str] = &[
+    V2026_07_28,
+    V2025_11_25,
+    V2025_06_18,
+    V2025_03_26,
+    V2024_11_05,
+];
 
 /// The versions that use the legacy stateful lifecycle (newest first).
 ///
@@ -19,9 +26,13 @@ pub const SUPPORTED_VERSIONS: &[&str] = &[V2026_07_28, V2025_06_18, V2025_03_26,
 /// modern version through it would ask a legacy server for a version it has
 /// never heard of.
 ///
-/// `2025-11-25` is deliberately absent: it is not supported (see the migration
-/// design note). Servers speaking it negotiate down to `2025-06-18`.
-pub const LEGACY_VERSIONS: &[&str] = &[V2025_06_18, V2025_03_26, V2024_11_05];
+/// `2025-11-25` is **negotiable but not fully implemented**: it is offered so a
+/// server whose newest legacy revision is `2025-11-25` (e.g. the reference
+/// `mcp` 2.x SDK) negotiates to it rather than being needlessly downgraded to
+/// `2025-06-18`. It is driven by the legacy stateful lifecycle; the revision's
+/// net-new additive features (icons metadata, URL-mode elicitation, …) are not
+/// consumed. See the migration design note.
+pub const LEGACY_VERSIONS: &[&str] = &[V2025_11_25, V2025_06_18, V2025_03_26, V2024_11_05];
 
 /// The current/latest supported MCP protocol version.
 pub const CURRENT_VERSION: &str = V2026_07_28;
@@ -33,7 +44,7 @@ pub const MINIMUM_VERSION: &str = V2024_11_05;
 pub const FIRST_MODERN_VERSION: &str = V2026_07_28;
 
 /// The newest revision still using the legacy stateful lifecycle.
-pub const LATEST_LEGACY_VERSION: &str = V2025_06_18;
+pub const LATEST_LEGACY_VERSION: &str = V2025_11_25;
 
 /// Validate that a version follows MCP format (YYYY-MM-DD).
 pub fn validate_format(version: &str) -> bool {
@@ -176,10 +187,13 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_2025_11_25_still_classifies_as_legacy() {
-        // We deliberately do not support this revision, but if one is ever seen
-        // on the wire it must not be mistaken for the stateless protocol.
-        assert!(!is_supported("2025-11-25"));
+    fn negotiable_2025_11_25_classifies_as_legacy() {
+        // 2025-11-25 is negotiable (so we don't needlessly downgrade against a
+        // 2025-11-25-capable server) but is driven as legacy — it must never be
+        // mistaken for the stateless 2026-era protocol.
+        assert!(is_supported("2025-11-25"));
         assert!(!is_modern_version("2025-11-25"));
+        assert!(LEGACY_VERSIONS.contains(&V2025_11_25));
+        assert_eq!(LATEST_LEGACY_VERSION, V2025_11_25);
     }
 }

@@ -237,11 +237,11 @@ fn versioning_full() {
 
     assert_eq!(MINIMUM_VERSION, "2024-11-05");
     assert_eq!(CURRENT_VERSION, "2026-07-28");
-    assert_eq!(SUPPORTED_VERSIONS.len(), 4);
+    assert_eq!(SUPPORTED_VERSIONS.len(), 5);
 
     // The legacy handshake list is a strict subset that excludes the stateless
     // revision — see `send_initialize_with_options`.
-    assert_eq!(LEGACY_VERSIONS.len(), 3);
+    assert_eq!(LEGACY_VERSIONS.len(), 4);
     assert!(LEGACY_VERSIONS.iter().all(|v| is_supported(v)));
     assert!(!LEGACY_VERSIONS.contains(&CURRENT_VERSION));
 

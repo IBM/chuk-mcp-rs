@@ -333,7 +333,8 @@ mod tests {
             ProtocolEra::from_protocol_version("2025-06-18"),
             ProtocolEra::Legacy
         );
-        // Unsupported and malformed both fall back to legacy, never modern.
+        // 2025-11-25 (a legacy revision) and malformed input both classify as
+        // legacy, never modern.
         assert_eq!(
             ProtocolEra::from_protocol_version("2025-11-25"),
             ProtocolEra::Legacy
@@ -426,7 +427,8 @@ mod tests {
             vec!["2026-07-28", "2025-11-25"]
         );
         // We pick our most-preferred mutually supported version, not the
-        // server's first: 2025-11-25 is one we deliberately do not support.
+        // server's first: we now negotiate 2025-11-25 too, but 2026-07-28 is
+        // preferred over it.
         assert_eq!(renegotiate(&err).as_deref(), Some("2026-07-28"));
     }
 
