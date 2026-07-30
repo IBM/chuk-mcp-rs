@@ -3,6 +3,7 @@
 pub mod http;
 pub mod http_dual;
 pub mod http_modern;
+pub mod limits;
 pub mod sse;
 pub mod stdio;
 

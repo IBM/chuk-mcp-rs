@@ -1,7 +1,7 @@
 /target
 Cargo.lock.bak
 
-# Coverage artifacts
+# Coverage artifacts (see .github/workflows/ci.yml)
 coverage.json
 *.profraw
 

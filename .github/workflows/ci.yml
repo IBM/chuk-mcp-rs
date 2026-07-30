@@ -43,7 +43,7 @@ jobs:
           PYO3_PYTHON: python3
 
   coverage:
-    name: Coverage (core crate, >=90%)
+    name: Coverage (core crate, >=90% per file)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -51,15 +51,24 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
-      - name: Coverage gate
-        # The demo-server binary is a subprocess fixture llvm-cov can't observe;
-        # every other source file is kept at >=90% line coverage.
+
+      # The demo-server binary is a subprocess fixture llvm-cov can't observe;
+      # every other source file is held at >=90% line coverage individually.
+      # `--fail-under-lines` would only compare the crate total, which a single
+      # badly-covered new file can hide behind, so the floor is enforced
+      # per-file by scripts/coverage-gate.py instead.
+      - name: Generate coverage report
         run: >
           cargo llvm-cov --package chuk-mcp
           --ignore-filename-regex 'bin/'
-          --fail-under-lines 90
-          --summary-only
+          --json --output-path coverage.json
+
+      - name: Per-file coverage gate
+        run: python3 scripts/coverage-gate.py coverage.json --min-lines 90
 
   wheels:
     name: Wheels (${{ matrix.platform.os }})

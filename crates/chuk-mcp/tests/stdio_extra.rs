@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use chuk_mcp::protocol::messages::initialize::InitializeOptions;
+use chuk_mcp::transports::limits::TransportLimits;
 use chuk_mcp::transports::stdio::{
     get_default_environment, stdio_client, stdio_client_with_initialize, StdioParameters,
     StdioTransport,
@@ -76,6 +77,38 @@ async fn protocol_version_and_close() {
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn reader_aborts_on_newline_free_output() {
+    init_tracing();
+    // A server process that streams without ever terminating a line must not
+    // grow the reader's buffer without bound: the reader gives up instead.
+    // The oversized run is newline-terminated and followed by a valid message:
+    // an uncapped reader would skip the unparseable line and deliver the
+    // message, so receiving nothing proves the cap aborted the read.
+    let script = "head -c 50000 /dev/zero | tr '\\0' 'A'; \
+         printf '\\n'; \
+         printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\\n'; \
+         sleep 0.4";
+    let mut transport = StdioTransport::start_with_limits(
+        StdioParameters::new("sh", ["-c", script]),
+        TransportLimits::default().with_max_buffer_size(1000),
+    )
+    .await
+    .unwrap();
+    let (read, _write) = transport.get_streams().await.unwrap();
+    let mut rx = read.lock().await;
+
+    // The reader task exits on the oversized line, closing the channel, so the
+    // trailing valid message never arrives.
+    let received = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("reader should stop rather than buffer indefinitely");
+    assert!(received.is_none(), "expected no message, got {received:?}");
+
+    drop(rx);
+    transport.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn reader_handles_edge_cases() {
     init_tracing();

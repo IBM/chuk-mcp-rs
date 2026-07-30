@@ -10,6 +10,9 @@ use tokio::sync::{mpsc, Semaphore};
 use crate::protocol::json_rpc::{parse_message_str, JsonRpcMessage};
 use crate::protocol::messages::send_message::{message_channel, ReadStream, WriteStream};
 use crate::protocol::types::errors::{McpError, INTERNAL_ERROR, PARSE_ERROR};
+use crate::transports::limits::{
+    exceeds_limit, read_body_bounded, too_large_error, TransportLimits,
+};
 use crate::transports::Transport;
 
 /// Parameters for Streamable HTTP transport.
@@ -101,6 +104,14 @@ pub struct StreamableHttpTransport {
 impl StreamableHttpTransport {
     /// Start the transport and its outgoing message handler.
     pub fn start(parameters: StreamableHttpParameters) -> Result<Self, McpError> {
+        Self::start_with_limits(parameters, TransportLimits::default())
+    }
+
+    /// Start the transport with explicit buffer limits.
+    pub fn start_with_limits(
+        parameters: StreamableHttpParameters,
+        limits: TransportLimits,
+    ) -> Result<Self, McpError> {
         let (incoming_tx, incoming) = message_channel(100);
         let (outgoing, mut outgoing_rx) = mpsc::channel::<JsonRpcMessage>(100);
 
@@ -113,6 +124,7 @@ impl StreamableHttpTransport {
             .map_err(|e| McpError::Transport(format!("Failed to build HTTP client: {e}")))?;
 
         let semaphore = Arc::new(Semaphore::new(parameters.max_concurrent_requests.max(1)));
+        let max_buffer_size = limits.max_buffer_size;
 
         let task = tokio::spawn(async move {
             while let Some(message) = outgoing_rx.recv().await {
@@ -123,7 +135,15 @@ impl StreamableHttpTransport {
                 let session = session_for_task.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    send_via_http(&client, &params, &session, &incoming_tx, message).await;
+                    send_via_http(
+                        &client,
+                        &params,
+                        &session,
+                        &incoming_tx,
+                        message,
+                        max_buffer_size,
+                    )
+                    .await;
                 });
             }
         });
@@ -153,6 +173,7 @@ pub(crate) async fn send_via_http(
     session: &Arc<std::sync::Mutex<Option<String>>>,
     incoming_tx: &mpsc::Sender<JsonRpcMessage>,
     message: JsonRpcMessage,
+    max_buffer_size: usize,
 ) {
     let message_id = message.id().cloned();
     let method = message.method().unwrap_or("unknown").to_string();
@@ -199,7 +220,9 @@ pub(crate) async fn send_via_http(
         .to_string();
 
     if status.as_u16() >= 400 {
-        let text = response.text().await.unwrap_or_default();
+        let text = read_body_bounded(response, max_buffer_size, "HTTP response")
+            .await
+            .unwrap_or_default();
         route_error(
             incoming_tx,
             &message_id,
@@ -211,11 +234,17 @@ pub(crate) async fn send_via_http(
     }
 
     if content_type.contains("text/event-stream") {
-        stream_sse_response(response, incoming_tx).await;
+        stream_sse_response(response, incoming_tx, max_buffer_size).await;
         return;
     }
 
-    let text = response.text().await.unwrap_or_default();
+    let text = match read_body_bounded(response, max_buffer_size, "HTTP response").await {
+        Ok(text) => text,
+        Err(e) => {
+            route_error(incoming_tx, &message_id, INTERNAL_ERROR, &e.to_string()).await;
+            return;
+        }
+    };
     if text.is_empty() {
         // Empty body (e.g. 202 Accepted). Fine for notifications; synthesize
         // an empty success for requests so callers don't hang.
@@ -271,32 +300,63 @@ async fn route_error(
 async fn stream_sse_response(
     response: reqwest::Response,
     incoming_tx: &mpsc::Sender<JsonRpcMessage>,
+    max_buffer_size: usize,
 ) {
+    process_sse_stream(response.bytes_stream(), incoming_tx, max_buffer_size).await;
+}
+
+/// Core SSE event loop, generic over the byte stream so tests can drive it
+/// with hand-built chunks.
+async fn process_sse_stream<S, B, E>(
+    mut stream: S,
+    incoming_tx: &mpsc::Sender<JsonRpcMessage>,
+    max_buffer_size: usize,
+) where
+    S: futures::Stream<Item = Result<B, E>> + Unpin,
+    B: AsRef<[u8]>,
+{
     use futures::StreamExt;
 
-    let mut buffer = String::new();
-    let mut stream = response.bytes_stream();
+    // Buffer bytes rather than text: a multi-byte character split across
+    // chunks must not be decoded until its event is complete.
+    let mut buffer: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
         let Ok(chunk) = chunk else { break };
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        buffer.extend_from_slice(chunk.as_ref());
 
         // Process complete events (separated by blank lines).
         while let Some(pos) = find_event_boundary(&buffer) {
-            let event_text: String = buffer.drain(..pos).collect();
-            process_sse_event_text(&event_text, incoming_tx).await;
+            let event_bytes: Vec<u8> = buffer.drain(..pos).collect();
+            process_sse_event_text(&String::from_utf8_lossy(&event_bytes), incoming_tx).await;
+        }
+
+        // A server that never completes an event would otherwise grow this
+        // buffer without bound - abort instead of exhausting memory.
+        // Checked after the complete events above are processed, so only
+        // the undelimited remainder counts toward the cap.
+        if exceeds_limit(buffer.len(), max_buffer_size) {
+            tracing::error!(
+                "{}",
+                too_large_error(buffer.len(), max_buffer_size, "SSE event")
+            );
+            return;
         }
     }
     // Trailing event without final blank line.
-    if !buffer.trim().is_empty() {
-        process_sse_event_text(&buffer, incoming_tx).await;
+    let trailing = String::from_utf8_lossy(&buffer);
+    if !trailing.trim().is_empty() {
+        process_sse_event_text(&trailing, incoming_tx).await;
     }
 }
 
 /// Find the end of the first complete SSE event (blank-line separator),
 /// returning the index just past the separator.
-fn find_event_boundary(buffer: &str) -> Option<usize> {
-    let lf = buffer.find("\n\n").map(|i| i + 2);
-    let crlf = buffer.find("\r\n\r\n").map(|i| i + 4);
+fn find_event_boundary(buffer: &[u8]) -> Option<usize> {
+    let lf = buffer.windows(2).position(|w| w == b"\n\n").map(|i| i + 2);
+    let crlf = buffer
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4);
     match (lf, crlf) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
@@ -397,7 +457,78 @@ mod tests {
 
     #[test]
     fn event_boundary() {
-        assert_eq!(find_event_boundary("data: x\n\nrest"), Some(9));
-        assert_eq!(find_event_boundary("data: x"), None);
+        assert_eq!(find_event_boundary(b"data: x\n\nrest"), Some(9));
+        assert_eq!(find_event_boundary(b"data: x"), None);
+    }
+
+    const EVENT: &[u8] = b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n";
+
+    #[tokio::test]
+    async fn sse_stream_routes_complete_events_before_cap_abort() {
+        use futures::StreamExt;
+
+        let (tx, mut rx) = mpsc::channel(10);
+
+        // One complete event, then an endless run with no event boundary. If
+        // the loop failed to abort, the stream would never end and the
+        // timeout would trip.
+        let mut first = EVENT.to_vec();
+        first.extend_from_slice(&[b'A'; 2000]);
+        let stream = futures::stream::iter([Ok::<_, ()>(first)])
+            .chain(futures::stream::repeat_with(|| Ok(vec![b'A'; 1000])));
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            process_sse_stream(stream, &tx, 1000),
+        )
+        .await
+        .expect("loop must abort once the undelimited remainder exceeds the cap");
+
+        // The complete event ahead of the oversized tail was still routed.
+        assert!(matches!(rx.try_recv(), Ok(JsonRpcMessage::Response(_))));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn sse_stream_cap_ignores_completed_events() {
+        let (tx, mut rx) = mpsc::channel(10);
+
+        // Three complete events in one chunk, together far larger than the
+        // cap: only the undelimited remainder counts, so nothing aborts.
+        let chunk = EVENT.repeat(3);
+        let cap = EVENT.len() + 1;
+        assert!(chunk.len() > cap);
+
+        process_sse_stream(futures::stream::iter([Ok::<_, ()>(chunk)]), &tx, cap).await;
+
+        for _ in 0..3 {
+            assert!(matches!(rx.try_recv(), Ok(JsonRpcMessage::Response(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_stream_reassembles_split_multibyte_chars() {
+        let (tx, mut rx) = mpsc::channel(10);
+
+        let event =
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"v\":\"\u{1f389}\"}}\n\n".as_bytes();
+        // Split mid-character: each half alone is invalid UTF-8, so decoding
+        // per chunk would mangle the character to U+FFFD.
+        let mid = event
+            .windows(4)
+            .position(|w| w == "\u{1f389}".as_bytes())
+            .unwrap()
+            + 2;
+        let stream = futures::stream::iter([
+            Ok::<_, ()>(event[..mid].to_vec()),
+            Ok(event[mid..].to_vec()),
+        ]);
+
+        process_sse_stream(stream, &tx, 1000).await;
+
+        let Ok(JsonRpcMessage::Response(resp)) = rx.try_recv() else {
+            panic!("expected a routed response");
+        };
+        assert!(serde_json::to_string(&resp).unwrap().contains('\u{1f389}'));
     }
 }

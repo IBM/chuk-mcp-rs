@@ -289,6 +289,42 @@ async fn server_dispatch_full() {
 }
 
 #[tokio::test]
+async fn server_serve_rejects_oversized_line() {
+    // A client that never terminates its line must not grow the server's
+    // buffer without bound.
+    let server = demo_server().with_max_buffer_size(1000);
+    let input = vec![b'A'; 100_000];
+    let mut out: Vec<u8> = Vec::new();
+
+    let err = server
+        .serve(tokio::io::BufReader::new(input.as_slice()), &mut out)
+        .await
+        .expect_err("oversized line should abort the serve loop");
+
+    assert!(err.to_string().contains("maximum buffered size"), "{err}");
+    assert!(out.is_empty());
+}
+
+#[tokio::test]
+async fn server_serve_allows_large_line_under_the_cap() {
+    // The cap must not break a legitimately large message.
+    let server = demo_server();
+    let padding = "x".repeat(100_000);
+    let input = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-06-18","clientInfo":{{"name":"{padding}"}}}}}}"#
+    ) + "\n";
+    let mut out: Vec<u8> = Vec::new();
+
+    server
+        .serve(tokio::io::BufReader::new(input.as_bytes()), &mut out)
+        .await
+        .unwrap();
+
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("protocolVersion"), "{out}");
+}
+
+#[tokio::test]
 async fn server_serve_over_pipe() {
     let server = demo_server();
     let input = concat!(

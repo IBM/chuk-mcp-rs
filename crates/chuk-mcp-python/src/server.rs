@@ -18,7 +18,7 @@ use chuk_mcp::server::{method_handler, McpServer as CoreServer};
 use crate::{coerce_to_json, json_to_py, py_to_json, to_py_err};
 
 /// A JSON-RPC message passed to / returned from custom method handlers.
-#[pyclass(name = "JSONRPCMessage")]
+#[pyclass(name = "JSONRPCMessage", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyJsonRpcMessage {
     pub(crate) inner: JsonRpcMessage,
@@ -27,7 +27,7 @@ pub struct PyJsonRpcMessage {
 #[pymethods]
 impl PyJsonRpcMessage {
     #[getter]
-    fn id(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn id(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         match self.inner.id() {
             Some(id) => json_to_py(py, &serde_json::to_value(id).unwrap_or(Value::Null)),
             None => Ok(py.None()),
@@ -38,21 +38,21 @@ impl PyJsonRpcMessage {
         self.inner.method()
     }
     #[getter]
-    fn params(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn params(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         match self.inner.params() {
             Some(v) => json_to_py(py, v),
             None => Ok(py.None()),
         }
     }
     #[getter]
-    fn result(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn result(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         match self.inner.result() {
             Some(v) => json_to_py(py, v),
             None => Ok(py.None()),
         }
     }
     #[getter]
-    fn error(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn error(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         match self.inner.error() {
             Some(e) => json_to_py(py, &serde_json::to_value(e).unwrap_or(Value::Null)),
             None => Ok(py.None()),
@@ -64,7 +64,7 @@ impl PyJsonRpcMessage {
         &self,
         py: Python<'_>,
         _kwargs: Option<Bound<'_, pyo3::types::PyDict>>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         json_to_py(py, &self.inner.to_value())
     }
 
@@ -99,13 +99,13 @@ impl PyProtocolHandler {
     /// Register an async handler `handler(message, session_id) -> (response, session)`
     /// for `method`. `response` is a JSONRPCMessage (from `create_response` /
     /// `create_error_response`) or None; `session` is usually None.
-    fn register_method(&self, method: String, handler: PyObject) -> PyResult<()> {
+    fn register_method(&self, method: String, handler: Py<PyAny>) -> PyResult<()> {
         let handler = Arc::new(handler);
         let bridge = method_handler(move |msg, session| {
             let handler = handler.clone();
             async move {
                 // Call the Python handler with a message object + session id.
-                let future = Python::with_gil(|py| -> PyResult<_> {
+                let future = Python::attach(|py| -> PyResult<_> {
                     let msg_obj = Py::new(py, PyJsonRpcMessage { inner: msg })?;
                     let coroutine = handler.bind(py).call1((msg_obj, session.clone()))?;
                     pyo3_async_runtimes::tokio::into_future(coroutine)
@@ -114,10 +114,10 @@ impl PyProtocolHandler {
 
                 let result = future.await.map_err(|e| e.to_string())?;
 
-                Python::with_gil(|py| {
+                Python::attach(|py| {
                     let bound = result.bind(py);
                     // Accept either (response, session) or a bare response.
-                    let (resp_item, session_item) = match bound.downcast::<PyTuple>() {
+                    let (resp_item, session_item) = match bound.cast::<PyTuple>() {
                         Ok(tuple) => {
                             let resp = tuple.get_item(0).map_err(|e| e.to_string())?;
                             let sess = if tuple.len() > 1 {
@@ -133,9 +133,13 @@ impl PyProtocolHandler {
                     let response = if resp_item.is_none() {
                         None
                     } else {
-                        let pymsg: PyRef<PyJsonRpcMessage> =
-                            resp_item.extract().map_err(|e: PyErr| e.to_string())?;
-                        Some(pymsg.inner.clone())
+                        // `extract()` into a PyRef no longer infers its error
+                        // type in pyo3 0.29; cast-then-borrow is the idiomatic
+                        // replacement and avoids naming the guard error at all.
+                        let pymsg = resp_item
+                            .cast::<PyJsonRpcMessage>()
+                            .map_err(|e| e.to_string())?;
+                        Some(pymsg.borrow().inner.clone())
                     };
 
                     let new_session = session_item
@@ -178,8 +182,8 @@ impl PyProtocolHandler {
                 .as_ref()
                 .ok_or_else(|| PyRuntimeError::new_err("Server not available"))?;
             let (response, new_session) = srv.handle_message(msg, session_id.as_deref()).await;
-            Python::with_gil(|py| -> PyResult<PyObject> {
-                let resp: PyObject = match response {
+            Python::attach(|py| -> PyResult<Py<PyAny>> {
+                let resp: Py<PyAny> = match response {
                     Some(inner) => Py::new(py, PyJsonRpcMessage { inner })?.into_any(),
                     None => py.None(),
                 };

@@ -17,7 +17,7 @@ use crate::streams::{PyReadStream, PyWriteStream};
 use crate::to_py_err;
 
 /// Parameters for the Streamable HTTP transport.
-#[pyclass(name = "StreamableHTTPParameters")]
+#[pyclass(name = "StreamableHTTPParameters", from_py_object)]
 #[derive(Clone)]
 pub struct PyStreamableHttpParameters {
     pub(crate) inner: CoreParams,

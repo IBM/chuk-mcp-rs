@@ -15,6 +15,9 @@ use tokio::sync::{mpsc, Notify};
 use crate::protocol::json_rpc::{parse_message_str, JsonRpcMessage};
 use crate::protocol::messages::send_message::{message_channel, ReadStream, WriteStream};
 use crate::protocol::types::errors::{McpError, INTERNAL_ERROR};
+use crate::transports::limits::{
+    exceeds_limit, read_body_bounded, too_large_error, TransportLimits,
+};
 use crate::transports::Transport;
 
 /// Parameters for the (deprecated) SSE transport.
@@ -90,6 +93,14 @@ impl SseTransport {
     /// Connect to the SSE endpoint and start the reader and sender tasks.
     /// Waits (up to the configured timeout) for the server's `endpoint` event.
     pub async fn start(parameters: SseParameters) -> Result<Self, McpError> {
+        Self::start_with_limits(parameters, TransportLimits::default()).await
+    }
+
+    /// Connect with explicit buffer limits.
+    pub async fn start_with_limits(
+        parameters: SseParameters,
+        limits: TransportLimits,
+    ) -> Result<Self, McpError> {
         let (incoming_tx, incoming) = message_channel(100);
         let (outgoing, outgoing_rx) = mpsc::channel::<JsonRpcMessage>(100);
 
@@ -114,6 +125,7 @@ impl SseTransport {
             parameters.clone(),
             shared.clone(),
             incoming_tx.clone(),
+            limits.max_buffer_size,
         ));
 
         let sender_task = tokio::spawn(outgoing_handler(
@@ -122,6 +134,7 @@ impl SseTransport {
             shared.clone(),
             outgoing_rx,
             incoming_tx,
+            limits.max_buffer_size,
         ));
 
         let transport = SseTransport {
@@ -171,6 +184,7 @@ async fn handle_sse_connection(
     params: SseParameters,
     shared: Arc<SseShared>,
     incoming_tx: mpsc::Sender<JsonRpcMessage>,
+    max_buffer_size: usize,
 ) {
     let sse_url = format!("{}{}", params.url, params.sse_endpoint);
     tracing::info!("Connecting to SSE endpoint: {sse_url}");
@@ -195,16 +209,41 @@ async fn handle_sse_connection(
         }
     };
 
-    let mut buffer = String::new();
-    let mut stream = response.bytes_stream();
+    process_sse_lines(
+        response.bytes_stream(),
+        &params,
+        &shared,
+        &incoming_tx,
+        max_buffer_size,
+    )
+    .await;
+    tracing::debug!("SSE stream ended");
+}
+
+/// Core SSE line loop, generic over the byte stream so tests can drive it
+/// with hand-built chunks.
+async fn process_sse_lines<S, B, E>(
+    mut stream: S,
+    params: &SseParameters,
+    shared: &SseShared,
+    incoming_tx: &mpsc::Sender<JsonRpcMessage>,
+    max_buffer_size: usize,
+) where
+    S: futures::Stream<Item = Result<B, E>> + Unpin,
+    B: AsRef<[u8]>,
+{
+    // Buffer bytes rather than text: a multi-byte character split across
+    // chunks must not be decoded until its line is complete.
+    let mut buffer: Vec<u8> = Vec::new();
     let mut current_event: Option<String> = None;
 
     while let Some(chunk) = stream.next().await {
         let Ok(chunk) = chunk else { break };
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        buffer.extend_from_slice(chunk.as_ref());
 
-        while let Some(newline) = buffer.find('\n') {
-            let line: String = buffer.drain(..=newline).collect();
+        while let Some(newline) = buffer.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = buffer.drain(..=newline).collect();
+            let line = String::from_utf8_lossy(&line_bytes);
             let line = line.trim_end_matches(['\n', '\r']);
 
             if line.is_empty() {
@@ -217,16 +256,16 @@ async fn handle_sse_connection(
             } else if let Some(rest) = line.strip_prefix("data:") {
                 let data = rest.trim();
                 match current_event.as_deref() {
-                    Some("endpoint") => handle_endpoint_event(data, &params, &shared),
-                    Some("message") => route_message_data(data, &incoming_tx).await,
+                    Some("endpoint") => handle_endpoint_event(data, params, shared),
+                    Some("message") => route_message_data(data, incoming_tx).await,
                     Some("keepalive") => tracing::debug!("Received keepalive"),
                     _ => {
                         // Untyped data: endpoint announcement or JSON-RPC.
                         let no_url = shared.message_url.lock().expect("url lock").is_none();
                         if no_url && (data.contains("/messages/") || data.contains("/mcp")) {
-                            handle_endpoint_event(data, &params, &shared);
+                            handle_endpoint_event(data, params, shared);
                         } else if data.starts_with('{') && data.contains("\"jsonrpc\"") {
-                            route_message_data(data, &incoming_tx).await;
+                            route_message_data(data, incoming_tx).await;
                         } else {
                             tracing::debug!("Unknown SSE data: {:.100}", data);
                         }
@@ -234,8 +273,19 @@ async fn handle_sse_connection(
                 }
             }
         }
+
+        // A server that never sends a newline would otherwise grow this
+        // buffer without bound - abort instead of exhausting memory.
+        // Checked after the complete lines above are processed, so only
+        // the undelimited remainder counts toward the cap.
+        if exceeds_limit(buffer.len(), max_buffer_size) {
+            tracing::error!(
+                "{}",
+                too_large_error(buffer.len(), max_buffer_size, "SSE event")
+            );
+            return;
+        }
     }
-    tracing::debug!("SSE stream ended");
 }
 
 /// Handle the `endpoint` event announcing where to POST messages.
@@ -283,6 +333,7 @@ async fn outgoing_handler(
     shared: Arc<SseShared>,
     mut outgoing_rx: mpsc::Receiver<JsonRpcMessage>,
     incoming_tx: mpsc::Sender<JsonRpcMessage>,
+    max_buffer_size: usize,
 ) {
     while let Some(message) = outgoing_rx.recv().await {
         let Some(message_url) = shared.message_url.lock().expect("url lock").clone() else {
@@ -303,17 +354,21 @@ async fn outgoing_handler(
                 let status = response.status().as_u16();
                 if status == 200 {
                     // Immediate HTTP response: route the body.
-                    if let Ok(text) = response.text().await {
-                        if !text.is_empty() {
+                    match read_body_bounded(response, max_buffer_size, "HTTP response").await {
+                        Ok(text) if !text.is_empty() => {
                             route_message_data(&text, &incoming_tx).await;
                         }
+                        Ok(_) => {}
+                        Err(e) => tracing::error!("Failed to read response body: {e}"),
                     }
                 } else if status == 202 {
                     // Async: the response arrives via the SSE stream and is
                     // routed by the reader task.
                     tracing::debug!("Message {message_id:?} accepted, awaiting SSE response");
                 } else {
-                    let text = response.text().await.unwrap_or_default();
+                    let text = read_body_bounded(response, max_buffer_size, "HTTP response")
+                        .await
+                        .unwrap_or_default();
                     // Try to parse the body anyway; otherwise synthesize error.
                     if parse_message_str(&text).is_ok() {
                         route_message_data(&text, &incoming_tx).await;
@@ -395,5 +450,33 @@ mod tests {
             Some("http://localhost:3000/messages/?session_id=abc123")
         );
         assert_eq!(shared.session_id.lock().unwrap().as_deref(), Some("abc123"));
+    }
+
+    #[tokio::test]
+    async fn sse_lines_processed_before_cap_abort() {
+        let params = SseParameters::new("http://localhost:3000").unwrap();
+        let shared = SseShared::default();
+        let (tx, _rx) = mpsc::channel(10);
+
+        // One complete endpoint event, then an endless run with no newline.
+        // If the loop failed to abort, the stream would never end and the
+        // timeout would trip.
+        let mut first = b"event: endpoint\ndata: /messages/?session_id=abc\n\n".to_vec();
+        first.extend_from_slice(&[b'A'; 2000]);
+        let stream = futures::stream::iter([Ok::<_, ()>(first)])
+            .chain(futures::stream::repeat_with(|| Ok(vec![b'A'; 1000])));
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            process_sse_lines(stream, &params, &shared, &tx, 1000),
+        )
+        .await
+        .expect("loop must abort once the undelimited remainder exceeds the cap");
+
+        // The complete lines ahead of the oversized tail were still handled.
+        assert_eq!(
+            shared.message_url.lock().unwrap().as_deref(),
+            Some("http://localhost:3000/messages/?session_id=abc")
+        );
     }
 }

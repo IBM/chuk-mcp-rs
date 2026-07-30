@@ -133,4 +133,24 @@ mod tests {
         mgr.sessions.get_mut(&id).unwrap().last_activity -= 7200.0;
         assert_eq!(mgr.cleanup_expired(3600.0), 1);
     }
+
+    #[test]
+    fn listing_and_clearing() {
+        let mut mgr = SessionManager::new();
+        assert!(mgr.list_sessions().is_empty());
+
+        let first = mgr.create_session(Map::new(), "2025-06-18", None);
+        let second = mgr.create_session(Map::new(), "2024-11-05", None);
+
+        let listed = mgr.list_sessions();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.contains_key(&first));
+        assert!(listed.contains_key(&second));
+
+        assert_eq!(mgr.clear_all_sessions(), 2);
+        assert_eq!(mgr.session_count(), 0);
+        assert!(mgr.get_session(&first).is_none());
+        // Clearing an already-empty manager reports nothing removed.
+        assert_eq!(mgr.clear_all_sessions(), 0);
+    }
 }

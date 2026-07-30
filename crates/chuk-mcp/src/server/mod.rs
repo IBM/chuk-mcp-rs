@@ -46,6 +46,7 @@ pub struct McpServer {
     pub protocol_handler: ProtocolHandler,
     tools: BTreeMap<String, RegisteredTool>,
     resources: BTreeMap<String, RegisteredResource>,
+    max_buffer_size: usize,
 }
 
 impl McpServer {
@@ -57,7 +58,17 @@ impl McpServer {
             protocol_handler: ProtocolHandler::new(server_info, capabilities),
             tools: BTreeMap::new(),
             resources: BTreeMap::new(),
+            max_buffer_size: crate::transports::limits::DEFAULT_MAX_BUFFER_SIZE,
         }
+    }
+
+    /// Set the maximum bytes buffered for a single inbound message (0 disables).
+    ///
+    /// Bounds how much a client can send without a newline before the server
+    /// gives up, rather than accumulating it all in memory.
+    pub fn with_max_buffer_size(mut self, max_buffer_size: usize) -> Self {
+        self.max_buffer_size = max_buffer_size;
+        self
     }
 
     /// Register a tool with its JSON Schema and async handler.
@@ -262,19 +273,26 @@ impl McpServer {
     /// stdin/stdout.
     pub async fn serve<R, W>(
         &self,
-        reader: R,
+        mut reader: R,
         mut writer: W,
     ) -> Result<(), crate::protocol::types::errors::McpError>
     where
         R: tokio::io::AsyncBufRead + Unpin,
         W: tokio::io::AsyncWrite + Unpin,
     {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
-        let mut lines = reader.lines();
         let mut session_id: Option<String> = None;
 
-        while let Some(line) = lines.next_line().await? {
+        // Bounded read: a client that never terminates a line would otherwise
+        // grow this buffer until the server runs out of memory.
+        while let Some(line) = crate::transports::limits::read_line_bounded(
+            &mut reader,
+            self.max_buffer_size,
+            "inbound message",
+        )
+        .await?
+        {
             let line = line.trim();
             if line.is_empty() {
                 continue;
