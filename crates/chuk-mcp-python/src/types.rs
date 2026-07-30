@@ -261,13 +261,43 @@ impl PyToolResult {
     fn text(&self) -> String {
         self.inner.text()
     }
+    /// The result envelope's `resultType`. A legacy result normalises to
+    /// `"complete"`, so this is always set whichever era produced the result.
+    #[getter(resultType)]
+    fn result_type(&self) -> &str {
+        &self.inner.result_type
+    }
+    /// The flattened 0.9-era value: structured data if the tool returned any,
+    /// else the text, else the raw content blocks.
+    #[getter]
+    fn value(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        json_to_py(py, &self.inner.value())
+    }
+    /// Structured content blocks, if any (list of dicts, or None).
+    #[getter(structuredContent)]
+    fn structured_content(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        match self.inner.structured_content() {
+            Some(blocks) => Ok(Some(json_to_py(py, &Value::Array(blocks.clone()))?)),
+            None => Ok(None),
+        }
+    }
+    /// The server's self-reported identity from `_meta` (a dict, or None).
+    /// Unverified — for display and attribution only.
+    #[getter(serverIdentity)]
+    fn server_identity(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        match self.inner.server_identity() {
+            Some(id) => Ok(Some(json_to_py(py, &id)?)),
+            None => Ok(None),
+        }
+    }
     fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         to_dict(py, &self.inner)
     }
     fn __repr__(&self) -> String {
         format!(
-            "ToolResult(blocks={}, isError={})",
+            "ToolResult(blocks={}, resultType={:?}, isError={})",
             self.inner.content.len(),
+            self.inner.result_type,
             self.inner.is_error
         )
     }
