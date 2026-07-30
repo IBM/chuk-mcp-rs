@@ -40,6 +40,28 @@ impl McpClient {
         }
     }
 
+    /// Build a client from an already-settled connection.
+    ///
+    /// The era has already been detected and the handshake (legacy `initialize`
+    /// or modern `server/discover`) already completed by the dual-era transport,
+    /// so the streams and server profile are supplied directly and no further
+    /// handshake is issued. Modern `_meta` injection, if any, lives in the
+    /// transport, so the ordinary `send_*`-backed operations work unchanged.
+    pub fn from_settled(
+        transport: impl Transport + 'static,
+        read: ReadStream,
+        write: WriteStream,
+        server_info: Option<ServerInfo>,
+        capabilities: Option<ServerCapabilities>,
+    ) -> Self {
+        McpClient {
+            transport: Box::new(transport),
+            streams: Some((read, write)),
+            server_info,
+            capabilities,
+        }
+    }
+
     /// Whether the initialization handshake has completed.
     pub fn initialized(&self) -> bool {
         self.streams.is_some()

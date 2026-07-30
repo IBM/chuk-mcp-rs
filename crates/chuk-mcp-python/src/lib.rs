@@ -14,10 +14,12 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use chuk_mcp::client::McpClient as CoreClient;
+use chuk_mcp::protocol::era::{EraMode, ProtocolEra};
 use chuk_mcp::protocol::types::capabilities::ServerCapabilities as CoreServerCapabilities;
 use chuk_mcp::protocol::types::info::ServerInfo;
 use chuk_mcp::server::McpServer as CoreServer;
 use chuk_mcp::transports::stdio::{StdioParameters as CoreStdioParameters, StdioTransport};
+use chuk_mcp::transports::stdio_dual::{stdio_client_dual, StdioDualOptions};
 
 mod http;
 mod server;
@@ -125,6 +127,10 @@ struct PyMcpClient {
     inner: Arc<Mutex<Option<CoreClient>>>,
     server_info: Option<ServerInfo>,
     capabilities: Option<CoreServerCapabilities>,
+    /// The negotiated protocol era: "legacy" or "2026-07-28".
+    era: String,
+    /// The negotiated protocol version, if known.
+    protocol_version: Option<String>,
 }
 
 impl PyMcpClient {
@@ -155,6 +161,18 @@ impl PyMcpClient {
     #[getter]
     fn capabilities(&self) -> Option<PyServerCapabilities> {
         self.capabilities.clone().map(PyServerCapabilities::from)
+    }
+
+    /// The negotiated protocol era: "legacy" or "2026-07-28".
+    #[getter]
+    fn era(&self) -> String {
+        self.era.clone()
+    }
+
+    /// The negotiated protocol version string, if known.
+    #[getter]
+    fn protocol_version(&self) -> Option<String> {
+        self.protocol_version.clone()
     }
 
     /// List available tools (list of Tool objects).
@@ -292,7 +310,7 @@ fn connect_to_server<'py>(
             .await
             .map_err(to_py_err)?;
         let mut client = CoreClient::new(transport);
-        client.initialize().await.map_err(to_py_err)?;
+        let init = client.initialize().await.map_err(to_py_err)?;
 
         let server_info = client.server_info.clone();
         let capabilities = client.capabilities.clone();
@@ -301,6 +319,54 @@ fn connect_to_server<'py>(
             inner: Arc::new(Mutex::new(Some(client))),
             server_info,
             capabilities,
+            era: ProtocolEra::Legacy.to_string(),
+            protocol_version: Some(init.protocol_version),
+        })
+    })
+}
+
+/// Connect to an MCP server over stdio with dual-era detection.
+///
+/// Probes with `server/discover`; a modern peer is driven with the stateless
+/// `2026-07-28` protocol (per-request `_meta`, injected by the transport) and a
+/// legacy peer falls back to the `initialize` handshake. `mode` is `"auto"`
+/// (default), `"legacy"`, or `"2026-07-28"`. The returned client exposes the
+/// negotiated `.era` and `.protocol_version`.
+#[pyfunction]
+#[pyo3(signature = (parameters, mode="auto"))]
+fn connect_dual_stdio<'py>(
+    py: Python<'py>,
+    parameters: PyStdioParameters,
+    mode: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    let era_mode: EraMode = mode.parse().map_err(to_py_err)?;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let options = StdioDualOptions {
+            mode: era_mode,
+            ..StdioDualOptions::default()
+        };
+        let conn = stdio_client_dual(parameters.inner, options)
+            .await
+            .map_err(to_py_err)?;
+
+        let era = conn.profile.era.to_string();
+        let protocol_version = Some(conn.profile.protocol_version.clone());
+        let server_info = conn.profile.server_info.clone();
+        let capabilities = Some(conn.profile.capabilities.clone());
+        let client = CoreClient::from_settled(
+            conn.transport,
+            conn.read,
+            conn.write,
+            server_info.clone(),
+            capabilities.clone(),
+        );
+
+        Ok(PyMcpClient {
+            inner: Arc::new(Mutex::new(Some(client))),
+            server_info,
+            capabilities,
+            era,
+            protocol_version,
         })
     })
 }
@@ -483,6 +549,7 @@ fn chuk_mcp_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     server::register(m)?;
     m.add_function(wrap_pyfunction!(connect_to_server, m)?)?;
     m.add_function(wrap_pyfunction!(supported_versions, m)?)?;
+    m.add_function(wrap_pyfunction!(connect_dual_stdio, m)?)?;
     m.add_function(wrap_pyfunction!(core_version, m)?)?;
     m.add_function(wrap_pyfunction!(get_default_environment, m)?)?;
 
@@ -497,6 +564,10 @@ fn chuk_mcp_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "CURRENT_VERSION",
         chuk_mcp::protocol::versioning::CURRENT_VERSION,
+    )?;
+    m.add(
+        "LATEST_LEGACY_VERSION",
+        chuk_mcp::protocol::versioning::LATEST_LEGACY_VERSION,
     )?;
     Ok(())
 }
