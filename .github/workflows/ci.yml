@@ -42,6 +42,24 @@ jobs:
         env:
           PYO3_PYTHON: python3
 
+  conformance:
+    name: Conformance (official MCP suite — client)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # Runs the official @modelcontextprotocol/conformance client scenarios
+      # (initialize, tools_call) against our client runner, for 2025-06-18 and
+      # 2025-11-25. Draft (2026-07-28) client scenarios are auth-only (Phase 5)
+      # and modern server conformance needs the modern chuk server — both
+      # tracked in the roadmap.
+      - name: Client conformance
+        run: ./scripts/run-conformance.sh
+
   coverage:
     name: Coverage (core crate, >=90% per file)
     runs-on: ubuntu-latest
