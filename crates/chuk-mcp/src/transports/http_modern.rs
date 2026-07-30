@@ -38,6 +38,7 @@ use crate::protocol::types::errors::{
     LOCAL_TRANSPORT_FAILURE,
 };
 use crate::protocol::versioning;
+use crate::transports::limits::{read_body_bounded, TransportLimits};
 use crate::transports::Transport;
 
 /// Parameters for the stateless Streamable HTTP transport.
@@ -132,6 +133,14 @@ pub struct ModernHttpTransport {
 
 impl ModernHttpTransport {
     pub fn start(parameters: ModernHttpParameters) -> Result<Self, McpError> {
+        Self::start_with_limits(parameters, TransportLimits::default())
+    }
+
+    /// Start the transport with explicit buffer limits.
+    pub fn start_with_limits(
+        parameters: ModernHttpParameters,
+        limits: TransportLimits,
+    ) -> Result<Self, McpError> {
         let (incoming_tx, incoming) = message_channel(100);
         let (outgoing, mut outgoing_rx) = mpsc::channel::<JsonRpcMessage>(100);
 
@@ -141,6 +150,7 @@ impl ModernHttpTransport {
             .map_err(|e| McpError::Transport(format!("Failed to build HTTP client: {e}")))?;
 
         let semaphore = Arc::new(Semaphore::new(parameters.max_concurrent_requests.max(1)));
+        let max_buffer_size = limits.max_buffer_size;
 
         let task = tokio::spawn(async move {
             while let Some(message) = outgoing_rx.recv().await {
@@ -150,7 +160,15 @@ impl ModernHttpTransport {
                 let incoming_tx = incoming_tx.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    dispatch_modern(&client, &params, &incoming_tx, message, false).await;
+                    dispatch_modern(
+                        &client,
+                        &params,
+                        &incoming_tx,
+                        message,
+                        false,
+                        max_buffer_size,
+                    )
+                    .await;
                 });
             }
         });
@@ -211,6 +229,7 @@ pub(crate) async fn dispatch_modern(
     incoming_tx: &mpsc::Sender<JsonRpcMessage>,
     message: JsonRpcMessage,
     allow_fallback: bool,
+    max_buffer_size: usize,
 ) -> Dispatched {
     let caller_id = message.id().cloned();
     let Some(method) = message.method().map(str::to_string) else {
@@ -261,17 +280,14 @@ pub(crate) async fn dispatch_modern(
             (Some(_), _) => Some(RequestId::Str(uuid::Uuid::new_v4().to_string())),
         };
 
-        match send_once(
-            client,
-            params,
-            incoming_tx,
-            &envelope,
-            &wire_id,
-            &caller_id,
+        let ctx = AttemptCtx {
+            envelope: &envelope,
+            wire_id: &wire_id,
+            caller_id: &caller_id,
             allow_fallback,
-        )
-        .await
-        {
+            max_buffer_size,
+        };
+        match send_once(client, params, incoming_tx, &ctx).await {
             Attempt::NotModern => return Dispatched::FallBackToLegacy,
             // A stream only exists after a 2xx, so the peer is modern either way.
             Attempt::StreamBroken if attempt < params.max_stream_retries => {
@@ -300,16 +316,32 @@ pub(crate) async fn dispatch_modern(
     }
 }
 
+/// Everything one attempt needs beyond the shared client and parameters.
+struct AttemptCtx<'a> {
+    envelope: &'a Envelope,
+    /// The id this attempt puts on the wire — fresh on every re-issue.
+    wire_id: &'a Option<RequestId>,
+    /// The id the caller is waiting on, which responses are retargeted onto.
+    caller_id: &'a Option<RequestId>,
+    /// Only true while the peer's era is still unknown.
+    allow_fallback: bool,
+    max_buffer_size: usize,
+}
+
 /// One POST and its response handling.
 async fn send_once(
     client: &reqwest::Client,
     params: &ModernHttpParameters,
     incoming_tx: &mpsc::Sender<JsonRpcMessage>,
-    envelope: &Envelope,
-    wire_id: &Option<RequestId>,
-    caller_id: &Option<RequestId>,
-    allow_fallback: bool,
+    ctx: &AttemptCtx<'_>,
 ) -> Attempt {
+    let AttemptCtx {
+        envelope,
+        wire_id,
+        caller_id,
+        allow_fallback,
+        max_buffer_size,
+    } = *ctx;
     let body = match wire_id {
         Some(id) => JsonRpcMessage::Request(create_request(
             &envelope.method,
@@ -364,7 +396,9 @@ async fn send_once(
         .to_string();
 
     if status >= 400 {
-        let text = response.text().await.unwrap_or_default();
+        let text = read_body_bounded(response, max_buffer_size, "HTTP error response")
+            .await
+            .unwrap_or_default();
 
         // While the era is still unknown, an error response is also the probe.
         // Only a *recognised modern* error proves a modern peer; anything else
@@ -394,10 +428,22 @@ async fn send_once(
     }
 
     if content_type.contains("text/event-stream") {
-        return stream_response(response, incoming_tx, wire_id, caller_id).await;
+        return stream_response(response, incoming_tx, wire_id, caller_id, max_buffer_size).await;
     }
 
-    let text = response.text().await.unwrap_or_default();
+    let text = match read_body_bounded(response, max_buffer_size, "HTTP response").await {
+        Ok(text) => text,
+        Err(e) => {
+            route_error(
+                incoming_tx,
+                caller_id,
+                LOCAL_MALFORMED_RESPONSE,
+                &e.to_string(),
+            )
+            .await;
+            return Attempt::Reported(Detection::Modern);
+        }
+    };
     if text.trim().is_empty() {
         // 202 Accepted for a notification. A request with an empty body would
         // otherwise hang the caller, so synthesise an empty success.
@@ -438,6 +484,7 @@ async fn stream_response(
     incoming_tx: &mpsc::Sender<JsonRpcMessage>,
     wire_id: &Option<RequestId>,
     caller_id: &Option<RequestId>,
+    max_buffer_size: usize,
 ) -> Attempt {
     use futures::StreamExt;
 
@@ -448,6 +495,22 @@ async fn stream_response(
     while let Some(chunk) = stream.next().await {
         let Ok(chunk) = chunk else { break };
         buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+        // A peer that never sends an event boundary would otherwise grow this
+        // buffer until the process dies. Bound it and give up on the stream.
+        if max_buffer_size > 0 && buffer.len() > max_buffer_size {
+            route_error(
+                incoming_tx,
+                caller_id,
+                LOCAL_MALFORMED_RESPONSE,
+                &format!(
+                    "SSE event exceeded the {max_buffer_size}-byte buffer limit \
+                     without a boundary"
+                ),
+            )
+            .await;
+            return Attempt::Reported(Detection::Modern);
+        }
 
         while let Some(pos) = find_event_boundary(&buffer) {
             let event: String = buffer.drain(..pos).collect();

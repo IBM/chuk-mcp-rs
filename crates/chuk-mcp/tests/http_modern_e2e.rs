@@ -19,6 +19,7 @@ use chuk_mcp::protocol::types::errors::{
     LOCAL_TRANSPORT_FAILURE,
 };
 use chuk_mcp::transports::http_modern::{ModernHttpParameters, ModernHttpTransport};
+use chuk_mcp::transports::limits::TransportLimits;
 use chuk_mcp::transports::Transport;
 
 /// One request as the server saw it.
@@ -63,6 +64,11 @@ enum Behaviour {
     /// A well-formed SSE stream padded with keep-alive comments and an event
     /// type the client must ignore, then the real response.
     SseWithNoise,
+    /// Opens an SSE stream and streams bytes forever without ever sending an
+    /// event boundary — the shape that grows a client's buffer until it dies.
+    SseWithoutBoundary,
+    /// A 200 whose JSON body is far larger than the configured limit.
+    OversizedBody,
 }
 
 type Log = Arc<Mutex<Vec<Seen>>>;
@@ -215,6 +221,30 @@ async fn handle_conn(
             );
             let _ = socket.write_all(head.as_bytes()).await;
             let _ = socket.write_all(body.as_bytes()).await;
+            return;
+        }
+        Behaviour::SseWithoutBoundary => {
+            let head =
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+            let _ = socket.write_all(head.as_bytes()).await;
+            // No blank line, ever.
+            let _ = socket.write_all(b"data: {\"padding\":\"").await;
+            let filler = "x".repeat(8 * 1024);
+            for _ in 0..64 {
+                if socket.write_all(filler.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+            return;
+        }
+        Behaviour::OversizedBody => {
+            let payload = format!("{{\"padding\":\"{}\"}}", "x".repeat(256 * 1024));
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(payload.as_bytes()).await;
             return;
         }
         Behaviour::Json | Behaviour::BreakFirstStream => {}
@@ -543,6 +573,66 @@ async fn sse_noise_is_ignored_and_the_response_still_arrives() {
         }
         other => panic!("expected a response, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn an_sse_stream_without_a_boundary_hits_the_buffer_limit() {
+    // A peer that withholds the event boundary would otherwise grow the client's
+    // buffer until the process dies. The limit must end the stream with an
+    // error rather than absorb it.
+    let (url, _log) = spawn_server(Behaviour::SseWithoutBoundary).await;
+    let transport = ModernHttpTransport::start_with_limits(
+        ModernHttpParameters::new(&url).unwrap(),
+        TransportLimits::default().with_max_buffer_size(64 * 1024),
+    )
+    .unwrap();
+    let (read, write) = transport.get_streams().await.unwrap();
+
+    let response = call(&read, &write, "tools/list", json!({}), RequestId::Num(1)).await;
+    match &response {
+        JsonRpcMessage::Error(e) => {
+            assert_eq!(e.error.code, LOCAL_MALFORMED_RESPONSE);
+            assert!(
+                e.error.message.contains("buffer limit"),
+                "{}",
+                e.error.message
+            );
+        }
+        other => panic!("expected the buffer limit to fire, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_oversized_response_body_hits_the_buffer_limit() {
+    let (url, _log) = spawn_server(Behaviour::OversizedBody).await;
+    let transport = ModernHttpTransport::start_with_limits(
+        ModernHttpParameters::new(&url).unwrap(),
+        TransportLimits::default().with_max_buffer_size(16 * 1024),
+    )
+    .unwrap();
+    let (read, write) = transport.get_streams().await.unwrap();
+
+    let response = call(&read, &write, "tools/list", json!({}), RequestId::Num(1)).await;
+    match &response {
+        JsonRpcMessage::Error(e) => assert_eq!(e.error.code, LOCAL_MALFORMED_RESPONSE),
+        other => panic!("expected the body limit to fire, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_generous_limit_leaves_normal_traffic_alone() {
+    // The bound must not interfere with ordinary responses.
+    let (url, _log) = spawn_server(Behaviour::SseWithNoise).await;
+    let transport = ModernHttpTransport::start_with_limits(
+        ModernHttpParameters::new(&url).unwrap(),
+        TransportLimits::default(),
+    )
+    .unwrap();
+    let (read, write) = transport.get_streams().await.unwrap();
+    assert!(matches!(
+        call(&read, &write, "tools/list", json!({}), RequestId::Num(1)).await,
+        JsonRpcMessage::Response(_)
+    ));
 }
 
 #[tokio::test]

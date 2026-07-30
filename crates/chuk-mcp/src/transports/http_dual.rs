@@ -45,6 +45,7 @@ use crate::protocol::types::errors::McpError;
 use crate::protocol::versioning;
 use crate::transports::http::{self, StreamableHttpParameters};
 use crate::transports::http_modern::{self, Dispatched, ModernHttpParameters};
+use crate::transports::limits::TransportLimits;
 use crate::transports::Transport;
 
 /// Parameters for the dual-era Streamable HTTP transport.
@@ -143,6 +144,14 @@ pub struct DualEraHttpTransport {
 
 impl DualEraHttpTransport {
     pub fn start(parameters: DualEraHttpParameters) -> Result<Self, McpError> {
+        Self::start_with_limits(parameters, TransportLimits::default())
+    }
+
+    /// Start the transport with explicit buffer limits, applied to both eras.
+    pub fn start_with_limits(
+        parameters: DualEraHttpParameters,
+        limits: TransportLimits,
+    ) -> Result<Self, McpError> {
         let (incoming_tx, incoming) = message_channel(100);
         let (outgoing, mut outgoing_rx) = mpsc::channel::<JsonRpcMessage>(100);
 
@@ -159,6 +168,7 @@ impl DualEraHttpTransport {
         let legacy_session = Arc::new(std::sync::Mutex::new(None::<String>));
 
         let semaphore = Arc::new(Semaphore::new(parameters.max_concurrent_requests.max(1)));
+        let max_buffer_size = limits.max_buffer_size;
         let cache_for_task = era_cache.clone();
         let key_for_task = key.clone();
 
@@ -181,6 +191,7 @@ impl DualEraHttpTransport {
                         &session,
                         &incoming_tx,
                         message,
+                        max_buffer_size,
                     )
                     .await;
                 });
@@ -215,13 +226,22 @@ async fn route(
     legacy_session: &Arc<std::sync::Mutex<Option<String>>>,
     incoming_tx: &mpsc::Sender<JsonRpcMessage>,
     message: JsonRpcMessage,
+    max_buffer_size: usize,
 ) {
     // A pinned mode ignores both the cache and detection — that is the point of
     // pinning, and why it works behind a gateway that mangles the 400 body.
     let era = params.mode.resolve(cache.get(key));
 
     if era == Some(ProtocolEra::Legacy) {
-        send_legacy(client, params, legacy_session, incoming_tx, message).await;
+        send_legacy(
+            client,
+            params,
+            legacy_session,
+            incoming_tx,
+            message,
+            max_buffer_size,
+        )
+        .await;
         return;
     }
 
@@ -234,6 +254,7 @@ async fn route(
         incoming_tx,
         message.clone(),
         unknown,
+        max_buffer_size,
     )
     .await;
 
@@ -254,7 +275,15 @@ async fn route(
             cache.insert(key.clone(), ProtocolEra::Legacy);
             // Safe to re-send: the modern attempt was rejected before the
             // server processed it.
-            send_legacy(client, params, legacy_session, incoming_tx, message).await;
+            send_legacy(
+                client,
+                params,
+                legacy_session,
+                incoming_tx,
+                message,
+                max_buffer_size,
+            )
+            .await;
         }
     }
 }
@@ -265,6 +294,7 @@ async fn send_legacy(
     legacy_session: &Arc<std::sync::Mutex<Option<String>>>,
     incoming_tx: &mpsc::Sender<JsonRpcMessage>,
     message: JsonRpcMessage,
+    max_buffer_size: usize,
 ) {
     http::send_via_http(
         client,
@@ -272,6 +302,7 @@ async fn send_legacy(
         legacy_session,
         incoming_tx,
         message,
+        max_buffer_size,
     )
     .await;
 }
