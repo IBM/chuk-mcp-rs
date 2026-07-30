@@ -34,11 +34,21 @@ pub struct CompletionResult {
     pub total: Option<u64>,
     #[serde(rename = "hasMore", skip_serializing_if = "Option::is_none")]
     pub has_more: Option<bool>,
+    #[serde(
+        rename = "resultType",
+        default = "crate::protocol::messages::result_envelope::default_result_type"
+    )]
+    pub result_type: String,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
 
 impl CompletionResult {
+    /// The flattened 0.9-era value: the completion values.
+    pub fn value(&self) -> Value {
+        serde_json::to_value(&self.values).unwrap_or(Value::Null)
+    }
+
     /// Validate the ≤100-values constraint from the spec.
     pub fn validate(&self) -> Result<(), McpError> {
         if self.values.len() > 100 {

@@ -9,6 +9,7 @@ pub mod notifications;
 pub mod ping;
 pub mod prompts;
 pub mod resources;
+pub mod result_envelope;
 pub mod roots;
 pub mod sampling;
 pub mod send_message;

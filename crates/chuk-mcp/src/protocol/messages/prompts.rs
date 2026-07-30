@@ -47,8 +47,28 @@ pub struct GetPromptResult {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub messages: Option<Vec<PromptMessage>>,
+    #[serde(
+        rename = "resultType",
+        default = "crate::protocol::messages::result_envelope::default_result_type"
+    )]
+    pub result_type: String,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+impl GetPromptResult {
+    /// The flattened 0.9-era value: the prompt messages if present, otherwise
+    /// the description.
+    pub fn value(&self) -> Value {
+        match &self.messages {
+            Some(messages) => serde_json::to_value(messages).unwrap_or(Value::Null),
+            None => self
+                .description
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        }
+    }
 }
 
 /// Result of `prompts/list`.
@@ -57,6 +77,11 @@ pub struct ListPromptsResult {
     pub prompts: Vec<Prompt>,
     #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    #[serde(
+        rename = "resultType",
+        default = "crate::protocol::messages::result_envelope::default_result_type"
+    )]
+    pub result_type: String,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }

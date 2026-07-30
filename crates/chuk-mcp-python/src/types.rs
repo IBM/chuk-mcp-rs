@@ -408,6 +408,16 @@ impl PyReadResourceResult {
             .map(PyResourceContent::from)
             .collect()
     }
+    #[getter(resultType)]
+    fn result_type(&self) -> &str {
+        &self.inner.result_type
+    }
+    /// Flattened 0.9-era value: the text of a single text content, else the
+    /// raw contents.
+    #[getter]
+    fn value(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        json_to_py(py, &self.inner.value())
+    }
     fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         to_dict(py, &self.inner)
     }
@@ -546,6 +556,15 @@ impl PyGetPromptResult {
             .as_ref()
             .map(|msgs| msgs.iter().cloned().map(PyPromptMessage::from).collect())
     }
+    #[getter(resultType)]
+    fn result_type(&self) -> &str {
+        &self.inner.result_type
+    }
+    /// Flattened 0.9-era value: the messages if present, else the description.
+    #[getter]
+    fn value(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        json_to_py(py, &self.inner.value())
+    }
     fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         to_dict(py, &self.inner)
     }
@@ -620,6 +639,10 @@ impl PyListToolsResult {
     fn next_cursor(&self) -> Option<&str> {
         self.inner.next_cursor.as_deref()
     }
+    #[getter(resultType)]
+    fn result_type(&self) -> &str {
+        &self.inner.result_type
+    }
     fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         to_dict(py, &self.inner)
     }
@@ -655,6 +678,10 @@ impl PyListResourcesResult {
     #[getter(nextCursor)]
     fn next_cursor(&self) -> Option<&str> {
         self.inner.next_cursor.as_deref()
+    }
+    #[getter(resultType)]
+    fn result_type(&self) -> &str {
+        &self.inner.result_type
     }
     fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         to_dict(py, &self.inner)
@@ -694,6 +721,10 @@ impl PyListPromptsResult {
     #[getter(nextCursor)]
     fn next_cursor(&self) -> Option<&str> {
         self.inner.next_cursor.as_deref()
+    }
+    #[getter(resultType)]
+    fn result_type(&self) -> &str {
+        &self.inner.result_type
     }
     fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         to_dict(py, &self.inner)

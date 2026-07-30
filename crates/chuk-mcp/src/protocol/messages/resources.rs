@@ -60,6 +60,11 @@ pub struct ListResourcesResult {
     pub resources: Vec<Resource>,
     #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    #[serde(
+        rename = "resultType",
+        default = "crate::protocol::messages::result_envelope::default_result_type"
+    )]
+    pub result_type: String,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -68,8 +73,27 @@ pub struct ListResourcesResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReadResourceResult {
     pub contents: Vec<ResourceContent>,
+    #[serde(
+        rename = "resultType",
+        default = "crate::protocol::messages::result_envelope::default_result_type"
+    )]
+    pub result_type: String,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+impl ReadResourceResult {
+    /// The flattened 0.9-era value: the text of a single text content block,
+    /// otherwise the raw contents.
+    pub fn value(&self) -> Value {
+        let contents = serde_json::to_value(&self.contents).unwrap_or(Value::Null);
+        if let Some([only]) = contents.as_array().map(Vec::as_slice) {
+            if let Some(text) = only.get("text").and_then(Value::as_str) {
+                return Value::String(text.to_string());
+            }
+        }
+        contents
+    }
 }
 
 /// Result of `resources/templates/list`.
@@ -79,6 +103,11 @@ pub struct ListResourceTemplatesResult {
     pub resource_templates: Vec<ResourceTemplate>,
     #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    #[serde(
+        rename = "resultType",
+        default = "crate::protocol::messages::result_envelope::default_result_type"
+    )]
+    pub result_type: String,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }

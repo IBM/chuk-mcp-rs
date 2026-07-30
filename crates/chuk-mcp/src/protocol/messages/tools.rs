@@ -4,19 +4,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::protocol::messages::method::MessageMethod;
+use crate::protocol::messages::result_envelope::default_result_type;
 use crate::protocol::messages::send_message::{send_message, ReadStream, WriteStream};
 use crate::protocol::meta;
 use crate::protocol::types::errors::McpError;
 
-/// The `resultType` of a result that ran to completion. A legacy result carries
-/// no `resultType`; it normalises upward to this so callers see one shape (D4).
-pub const RESULT_TYPE_COMPLETE: &str = "complete";
 /// Envelope key for structured tool output (2025-06-18+, carried through 2026).
 const STRUCTURED_CONTENT_KEY: &str = "structuredContent";
-
-fn default_result_type() -> String {
-    RESULT_TYPE_COMPLETE.to_string()
-}
 
 /// A tool definition as returned by `tools/list`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -109,6 +103,8 @@ pub struct ListToolsResult {
     pub tools: Vec<Tool>,
     #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    #[serde(rename = "resultType", default = "default_result_type")]
+    pub result_type: String,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -161,6 +157,7 @@ pub fn is_tools_list_changed_notification(msg: &crate::protocol::json_rpc::JsonR
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::messages::result_envelope::RESULT_TYPE_COMPLETE;
 
     #[test]
     fn tool_result_text() {
