@@ -103,6 +103,27 @@ async fn ping_false_before_init() {
     assert!(!client.ping().await); // not initialized -> false
 }
 
+#[tokio::test]
+async fn client_from_settled_skips_handshake() {
+    use chuk_mcp::protocol::types::info::ServerInfo;
+
+    // A dual-era connection settles the era and handshake itself, then hands the
+    // client the streams + profile: no initialize() is issued, yet the client is
+    // ready and its send_*-backed operations work over the settled streams.
+    let transport = FakeTransport::new();
+    let (read, write) = transport.get_streams().await.unwrap();
+    let client = McpClient::from_settled(
+        transport,
+        read,
+        write,
+        Some(ServerInfo::new("modern", "2")),
+        None,
+    );
+    assert!(client.initialized());
+    assert_eq!(client.server_info.as_ref().unwrap().name, "modern");
+    assert_eq!(client.list_tools().await.unwrap()[0].name, "t");
+}
+
 // --- server dispatch -----------------------------------------------------
 
 fn demo_server() -> McpServer {
