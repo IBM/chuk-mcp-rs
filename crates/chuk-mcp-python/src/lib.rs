@@ -271,6 +271,26 @@ impl PyMcpClient {
         })
     }
 
+    /// The raw `(read, write)` stream pair, for driving the lower-level `send_*`
+    /// helpers directly. The era is already settled and `_meta` injection (if
+    /// the peer is modern) lives in the transport, so the same `send_*` calls
+    /// work whichever era this connection negotiated. Resolves to a
+    /// `(ReadStream, WriteStream)` tuple.
+    fn raw_streams<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.client();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let guard = client.lock().await;
+            let core = guard
+                .as_ref()
+                .ok_or_else(|| to_py_err(chuk_mcp::McpError::Transport("client is closed".into())))?;
+            let (read, write) = core.raw_streams().map_err(to_py_err)?;
+            Ok((
+                crate::streams::PyReadStream { inner: read },
+                crate::streams::PyWriteStream { inner: write },
+            ))
+        })
+    }
+
     /// Shut down the underlying transport.
     fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.client();
