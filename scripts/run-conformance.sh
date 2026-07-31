@@ -1,29 +1,70 @@
 #!/usr/bin/env bash
 #
-# Runs the official MCP conformance suite (@modelcontextprotocol/conformance)
-# against chuk-mcp's client, via the `chuk-mcp-conformance-client` runner binary.
+# The full conformance run: our own two-era rule suite, then the official
+# @modelcontextprotocol/conformance scenarios.
 #
-# Scope today: the *core client* scenarios (initialize, tools_call) under the
-# stateful date versions 2025-06-18 and 2025-11-25. The draft (2026-07-28)
-# *client* scenarios are auth-only (Phase 5), and modern *server* conformance
-# needs the not-yet-built modern chuk server — both are tracked in the roadmap.
+# Stage 1  in-repo suite    — every rule, both eras, client and server.
+# Stage 2  official client  — the reference scenarios our client passes.
+# Stage 3  known gaps       — reference scenarios we do not pass yet. Opt-in
+#                             (--gaps); reported, never fatal.
 #
-# Usage: scripts/run-conformance.sh
+# Server-side reference scenarios are not run: the official suite drives a
+# server over `--url`, and this crate's server has no HTTP serving mode yet
+# (stdio only). Stage 1 covers the server's behaviour in the meantime.
+#
+# The draft (2026-07-28) client scenarios upstream are auth-only, so the modern
+# era is covered by stage 1 rather than by the reference suite.
+#
+# Usage: scripts/run-conformance.sh [--gaps]
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CONFORMANCE="@modelcontextprotocol/conformance@0.1.16"
-SCENARIOS=("initialize" "tools_call")
-VERSIONS=("2025-06-18" "2025-11-25")
+
+# Scenarios our client passes. These block the run.
+CLIENT_SCENARIOS=("initialize" "tools_call")
+CLIENT_VERSIONS=("2025-06-18" "2025-11-25")
+
+# Scenarios needing client features we have not built yet, as
+# "scenario:version:what is missing". Reported, never fatal — the point is to
+# keep the gap visible rather than to fail a build over known work.
+KNOWN_GAPS=(
+  "sse-retry:2025-11-25:GET reconnection after a graceful SSE stream close"
+  "elicitation-sep1034-client-defaults:2025-11-25:handling server-initiated elicitation/create"
+)
+
+RUN_GAPS=0
+for arg in "$@"; do
+  case "$arg" in
+    --gaps) RUN_GAPS=1 ;;
+    *) echo "unknown option: $arg" >&2; exit 2 ;;
+  esac
+done
+
+failures=0
+
+# --- Stage 1: the in-repo rule suite --------------------------------------
+
+echo "== in-repo conformance suite (both eras, client + server) =="
+if cargo test --quiet --manifest-path "$ROOT/Cargo.toml" \
+     -p chuk-mcp --test conformance -- --nocapture; then
+  echo "  PASS  in-repo suite"
+else
+  echo "  FAIL  in-repo suite"
+  failures=$((failures + 1))
+fi
+echo
+
+# --- Stage 2: the official client scenarios -------------------------------
 
 echo "Building the conformance client runner..."
 cargo build --quiet --manifest-path "$ROOT/Cargo.toml" --bin chuk-mcp-conformance-client
 BIN="$ROOT/target/debug/chuk-mcp-conformance-client"
+echo
 
-failures=0
-for ver in "${VERSIONS[@]}"; do
-  for sc in "${SCENARIOS[@]}"; do
-    echo "== conformance client: ${sc} @ ${ver} =="
+for ver in "${CLIENT_VERSIONS[@]}"; do
+  for sc in "${CLIENT_SCENARIOS[@]}"; do
+    echo "== official client: ${sc} @ ${ver} =="
     if npx --yes "$CONFORMANCE" client \
         --command "$BIN" --scenario "$sc" --spec-version "$ver"; then
       echo "  PASS  ${sc} @ ${ver}"
@@ -34,10 +75,36 @@ for ver in "${VERSIONS[@]}"; do
   done
 done
 
+# --- Stage 3: known gaps ---------------------------------------------------
+
+echo
+if [ "$RUN_GAPS" -eq 1 ]; then
+  echo "== known gaps (reported, non-blocking) =="
+  for entry in "${KNOWN_GAPS[@]}"; do
+    IFS=':' read -r sc ver missing <<< "$entry"
+    echo "-- ${sc} @ ${ver} — needs: ${missing}"
+    if npx --yes "$CONFORMANCE" client \
+        --command "$BIN" --scenario "$sc" --spec-version "$ver" >/dev/null 2>&1; then
+      echo "  NOW PASSING — promote it into CLIENT_SCENARIOS"
+    else
+      echo "  still failing, as expected"
+    fi
+  done
+else
+  echo "Known gaps not run (pass --gaps to check them):"
+  for entry in "${KNOWN_GAPS[@]}"; do
+    IFS=':' read -r sc ver missing <<< "$entry"
+    echo "  ${sc} @ ${ver} — needs: ${missing}"
+  done
+fi
+
+# --- Summary ---------------------------------------------------------------
+
+blocking=$(( ${#CLIENT_VERSIONS[@]} * ${#CLIENT_SCENARIOS[@]} + 1 ))
 echo
 if [ "$failures" -eq 0 ]; then
-  echo "Conformance: all $(( ${#VERSIONS[@]} * ${#SCENARIOS[@]} )) client scenarios passed."
+  echo "Conformance: all ${blocking} blocking check(s) passed."
 else
-  echo "Conformance: ${failures} scenario(s) failed."
+  echo "Conformance: ${failures} of ${blocking} blocking check(s) failed."
 fi
 exit "$failures"
