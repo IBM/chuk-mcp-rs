@@ -2,6 +2,7 @@
 
 use serde_json::Value;
 
+use crate::protocol::era::{ProtocolEra, ServerProfile};
 use crate::protocol::messages::initialize::{send_initialize, InitializeResult};
 use crate::protocol::messages::ping::send_ping;
 use crate::protocol::messages::prompts::{
@@ -19,24 +20,31 @@ use crate::transports::stdio::{StdioParameters, StdioTransport};
 use crate::transports::Transport;
 
 /// High-level MCP client over any [`Transport`].
+///
+/// What the connection settled on — the server's identity and capabilities, the
+/// era, the version — is read through accessors rather than fields. All four
+/// are decided by the handshake and meaningless to assign afterwards, so none
+/// of them is exposed as something you can set.
 pub struct McpClient {
     transport: Box<dyn Transport>,
     streams: Option<(ReadStream, WriteStream)>,
-    /// Server info from initialization, if initialized.
-    pub server_info: Option<ServerInfo>,
-    /// Server capabilities from initialization, if initialized.
-    pub capabilities: Option<ServerCapabilities>,
+    server_info: Option<ServerInfo>,
+    capabilities: Option<ServerCapabilities>,
+    era: Option<ProtocolEra>,
+    protocol_version: Option<String>,
 }
 
 impl McpClient {
     /// Wrap a started transport. Call [`McpClient::initialize`] (or use
-    /// [`connect_to_server`]) before issuing requests.
+    /// [`connect`](crate::connect)) before issuing requests.
     pub fn new(transport: impl Transport + 'static) -> Self {
         McpClient {
             transport: Box::new(transport),
             streams: None,
             server_info: None,
             capabilities: None,
+            era: None,
+            protocol_version: None,
         }
     }
 
@@ -47,6 +55,11 @@ impl McpClient {
     /// so the streams and server profile are supplied directly and no further
     /// handshake is issued. Modern `_meta` injection, if any, lives in the
     /// transport, so the ordinary `send_*`-backed operations work unchanged.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use `from_profile`, which also carries the era and protocol version through; \
+                a client built here reports `era() == None` even though the era is known"
+    )]
     pub fn from_settled(
         transport: impl Transport + 'static,
         read: ReadStream,
@@ -59,12 +72,59 @@ impl McpClient {
             streams: Some((read, write)),
             server_info,
             capabilities,
+            era: None,
+            protocol_version: None,
+        }
+    }
+
+    /// Build a client from an already-settled connection and the profile the
+    /// peer reported.
+    ///
+    /// Prefer this to [`McpClient::from_settled`]: it carries the era and
+    /// version through, so [`McpClient::era`] and
+    /// [`McpClient::protocol_version`] can answer afterwards.
+    pub fn from_profile(
+        transport: impl Transport + 'static,
+        read: ReadStream,
+        write: WriteStream,
+        profile: ServerProfile,
+    ) -> Self {
+        McpClient {
+            transport: Box::new(transport),
+            streams: Some((read, write)),
+            server_info: profile.server_info,
+            capabilities: Some(profile.capabilities),
+            era: Some(profile.era),
+            protocol_version: Some(profile.protocol_version),
         }
     }
 
     /// Whether the initialization handshake has completed.
     pub fn initialized(&self) -> bool {
         self.streams.is_some()
+    }
+
+    /// Which protocol generation this connection settled on, once it has.
+    ///
+    /// `None` only before a connection is established — every path that
+    /// completes a handshake records it.
+    pub fn era(&self) -> Option<ProtocolEra> {
+        self.era
+    }
+
+    /// The protocol version in use, once negotiated.
+    pub fn protocol_version(&self) -> Option<&str> {
+        self.protocol_version.as_deref()
+    }
+
+    /// Who the server says it is, once the handshake has run.
+    pub fn server_info(&self) -> Option<&ServerInfo> {
+        self.server_info.as_ref()
+    }
+
+    /// What the server said it can do, once the handshake has run.
+    pub fn capabilities(&self) -> Option<&ServerCapabilities> {
+        self.capabilities.as_ref()
     }
 
     /// Perform the MCP initialization handshake (idempotent).
@@ -74,6 +134,10 @@ impl McpClient {
 
         self.server_info = Some(result.server_info.clone());
         self.capabilities = Some(result.capabilities.clone());
+        // `initialize` exists only in the legacy era, so reaching here settles
+        // the question without a separate probe.
+        self.era = Some(ProtocolEra::Legacy);
+        self.protocol_version = Some(result.protocol_version.clone());
         self.transport
             .set_protocol_version(&result.protocol_version);
         self.streams = Some((read, write));
@@ -150,6 +214,14 @@ impl McpClient {
 
 /// Connect to an MCP server over stdio with automatic initialization,
 /// mirroring the Python `connect_to_server` context manager.
+///
+/// Legacy era only: it goes straight to `initialize` without asking whether the
+/// peer is a `2026-07-28` server, which will fail against one.
+#[deprecated(
+    since = "0.1.0",
+    note = "use `connect(\"command args\")` or `Connect::to_command(..)`, which detect the \
+            protocol era instead of assuming the legacy handshake"
+)]
 pub async fn connect_to_server(parameters: StdioParameters) -> Result<McpClient, McpError> {
     let transport = StdioTransport::start(parameters).await?;
     connect_with_transport(transport).await

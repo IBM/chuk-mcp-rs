@@ -1,6 +1,9 @@
 //! Coverage-oriented tests for the high-level client, the server dispatch, and
 //! the protocol handler.
 
+// Covers `McpClient::from_settled` deliberately: deprecated in favour of
+// `from_profile`, but still supported.
+#![allow(deprecated)]
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
@@ -68,8 +71,8 @@ async fn client_full_flow() {
     let init = client.initialize().await.unwrap();
     assert_eq!(init.server_info.name, "fake");
     assert!(client.initialized());
-    assert_eq!(client.server_info.as_ref().unwrap().name, "fake");
-    assert!(client.capabilities.is_some());
+    assert_eq!(client.server_info().unwrap().name, "fake");
+    assert!(client.capabilities().is_some());
     // idempotent
     client.initialize().await.unwrap();
 
@@ -120,7 +123,7 @@ async fn client_from_settled_skips_handshake() {
         None,
     );
     assert!(client.initialized());
-    assert_eq!(client.server_info.as_ref().unwrap().name, "modern");
+    assert_eq!(client.server_info().unwrap().name, "modern");
     assert_eq!(client.list_tools().await.unwrap()[0].name, "t");
 }
 

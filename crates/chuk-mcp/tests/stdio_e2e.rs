@@ -1,5 +1,8 @@
 //! End-to-end test: Rust client ↔ demo server over the stdio transport.
 
+// Exercises `connect_to_server` deliberately: it is deprecated in favour of
+// `connect`, but still supported, so it stays covered.
+#![allow(deprecated)]
 use serde_json::{json, Value};
 
 use chuk_mcp::client::connect_to_server;
@@ -23,7 +26,7 @@ async fn full_client_server_roundtrip() {
         .expect("connect + initialize");
 
     // Initialization populated server metadata.
-    let info = client.server_info.clone().expect("server info");
+    let info = client.server_info().cloned().expect("server info");
     assert_eq!(info.name, "chuk-mcp-demo");
 
     // Ping.

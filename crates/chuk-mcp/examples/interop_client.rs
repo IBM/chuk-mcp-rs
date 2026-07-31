@@ -2,10 +2,7 @@
 //!
 //! Usage: cargo run --example interop_client -- <command> [args...]
 
-use serde_json::json;
-
-use chuk_mcp::client::connect_to_server;
-use chuk_mcp::transports::stdio::StdioParameters;
+use chuk_mcp::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -13,11 +10,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let command = argv
         .next()
         .expect("usage: interop_client <command> [args...]");
-    let params = StdioParameters::new(command, argv);
 
-    let mut client = connect_to_server(params).await?;
-    let info = client.server_info.clone().expect("server info");
-    println!("initialized: {} v{}", info.name, info.version);
+    let mut client = Connect::to_command(command, argv).connect().await?;
+    let info = client.server_info().cloned().expect("server info");
+    println!(
+        "connected: {} v{} over {}",
+        info.name,
+        info.version,
+        client
+            .era()
+            .map(|era| era.to_string())
+            .unwrap_or_else(|| "an unknown era".to_string()),
+    );
 
     println!("ping: {}", client.ping().await);
 

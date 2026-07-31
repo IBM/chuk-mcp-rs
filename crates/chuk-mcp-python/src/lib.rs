@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -14,6 +15,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use chuk_mcp::client::McpClient as CoreClient;
+use chuk_mcp::connect::Connect as CoreConnect;
 use chuk_mcp::protocol::era::{EraMode, ProtocolEra};
 use chuk_mcp::protocol::types::capabilities::ServerCapabilities as CoreServerCapabilities;
 use chuk_mcp::protocol::types::info::ServerInfo;
@@ -21,10 +23,15 @@ use chuk_mcp::server::McpServer as CoreServer;
 use chuk_mcp::transports::stdio::{StdioParameters as CoreStdioParameters, StdioTransport};
 use chuk_mcp::transports::stdio_dual::{stdio_client_dual, StdioDualOptions};
 
+mod arguments;
 mod http;
 mod server;
 mod streams;
 mod types;
+use arguments::{ResourceParts, ToolParts};
+
+/// The mime type a resource is assumed to serve when none is given.
+const DEFAULT_RESOURCE_MIME_TYPE: &str = "text/plain";
 use types::{
     PyGetPromptResult, PyPrompt, PyReadResourceResult, PyResource, PyServerCapabilities,
     PyServerInfo, PyTool, PyToolResult,
@@ -134,6 +141,23 @@ struct PyMcpClient {
 }
 
 impl PyMcpClient {
+    /// Wrap a settled core client, reading the era and version off it rather
+    /// than asking the caller to restate what the handshake already decided.
+    fn wrap(client: CoreClient) -> PyMcpClient {
+        let server_info = client.server_info().cloned();
+        let capabilities = client.capabilities().cloned();
+        let era = client.era().unwrap_or(ProtocolEra::Legacy).to_string();
+        let protocol_version = client.protocol_version().map(str::to_string);
+
+        PyMcpClient {
+            inner: Arc::new(Mutex::new(Some(client))),
+            server_info,
+            capabilities,
+            era,
+            protocol_version,
+        }
+    }
+
     fn client(&self) -> Arc<Mutex<Option<CoreClient>>> {
         self.inner.clone()
     }
@@ -280,9 +304,9 @@ impl PyMcpClient {
         let client = self.client();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let guard = client.lock().await;
-            let core = guard
-                .as_ref()
-                .ok_or_else(|| to_py_err(chuk_mcp::McpError::Transport("client is closed".into())))?;
+            let core = guard.as_ref().ok_or_else(|| {
+                to_py_err(chuk_mcp::McpError::Transport("client is closed".into()))
+            })?;
             let (read, write) = core.raw_streams().map_err(to_py_err)?;
             Ok((
                 crate::streams::PyReadStream { inner: read },
@@ -318,7 +342,71 @@ impl PyMcpClient {
     }
 }
 
+/// Connect to an MCP server — a URL or a command line — in one call.
+///
+/// `"http://…"` / `"https://…"` is a Streamable HTTP endpoint; anything else is
+/// a command line to spawn, split on whitespace. The protocol era is detected
+/// and its handshake completed, so the returned MCPClient is ready to use and
+/// reports the negotiated `.era` and `.protocol_version`.
+///
+/// ```text
+/// client = await connect("https://example.com/mcp", bearer_token=token)
+/// client = await connect("python server.py")
+/// ```
+///
+/// `era` pins the protocol generation instead of detecting it: `"auto"`
+/// (default), `"legacy"` or `"2026-07-28"`. `bearer_token` and `headers` apply
+/// to HTTP targets, `env` to subprocess targets; `timeout` is in seconds and
+/// bounds the probe or handshake.
+#[pyfunction]
+#[pyo3(signature = (
+    target,
+    era="auto",
+    bearer_token=None,
+    headers=None,
+    env=None,
+    timeout=None,
+    credential_context=None,
+))]
+#[allow(clippy::too_many_arguments)]
+fn connect<'py>(
+    py: Python<'py>,
+    target: String,
+    era: &str,
+    bearer_token: Option<String>,
+    headers: Option<HashMap<String, String>>,
+    env: Option<HashMap<String, String>>,
+    timeout: Option<f64>,
+    credential_context: Option<String>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let mode: EraMode = era.parse().map_err(to_py_err)?;
+
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let mut builder = CoreConnect::to(target).era(mode);
+        if let Some(token) = bearer_token {
+            builder = builder.bearer_token(token);
+        }
+        for (name, value) in headers.unwrap_or_default() {
+            builder = builder.header(name, value);
+        }
+        if let Some(env) = env {
+            builder = builder.env(env);
+        }
+        if let Some(seconds) = timeout {
+            builder = builder.timeout(Duration::from_secs_f64(seconds));
+        }
+        if let Some(context) = credential_context {
+            builder = builder.credential_context(context);
+        }
+
+        let client = builder.connect().await.map_err(to_py_err)?;
+        Ok(PyMcpClient::wrap(client))
+    })
+}
+
 /// Connect to an MCP server over stdio with automatic initialization.
+///
+/// Prefer [`connect`], which also handles HTTP targets and detects the era.
 /// Returns an MCPClient (also usable as an async context manager).
 #[pyfunction]
 fn connect_to_server<'py>(
@@ -330,18 +418,8 @@ fn connect_to_server<'py>(
             .await
             .map_err(to_py_err)?;
         let mut client = CoreClient::new(transport);
-        let init = client.initialize().await.map_err(to_py_err)?;
-
-        let server_info = client.server_info.clone();
-        let capabilities = client.capabilities.clone();
-
-        Ok(PyMcpClient {
-            inner: Arc::new(Mutex::new(Some(client))),
-            server_info,
-            capabilities,
-            era: ProtocolEra::Legacy.to_string(),
-            protocol_version: Some(init.protocol_version),
-        })
+        client.initialize().await.map_err(to_py_err)?;
+        Ok(PyMcpClient::wrap(client))
     })
 }
 
@@ -369,25 +447,12 @@ fn connect_dual_stdio<'py>(
             .await
             .map_err(to_py_err)?;
 
-        let era = conn.profile.era.to_string();
-        let protocol_version = Some(conn.profile.protocol_version.clone());
-        let server_info = conn.profile.server_info.clone();
-        let capabilities = Some(conn.profile.capabilities.clone());
-        let client = CoreClient::from_settled(
+        Ok(PyMcpClient::wrap(CoreClient::from_profile(
             conn.transport,
             conn.read,
             conn.write,
-            server_info.clone(),
-            capabilities.clone(),
-        );
-
-        Ok(PyMcpClient {
-            inner: Arc::new(Mutex::new(Some(client))),
-            server_info,
-            capabilities,
-            era,
-            protocol_version,
-        })
+            conn.profile,
+        )))
     })
 }
 
@@ -427,19 +492,32 @@ impl PyMcpServer {
         }
     }
 
-    /// Register a tool. `handler` is an async callable taking keyword-friendly
-    /// `arguments` (a dict) and returning a str or JSON-serializable value.
-    #[pyo3(signature = (name, handler, schema, description=""))]
+    /// Register a tool.
+    ///
+    /// `handler` is an async callable taking the tool's arguments as keywords
+    /// and returning a str or any JSON-serializable value; `schema` is the
+    /// tool's JSON Schema as a mapping; `description` is a string.
+    ///
+    /// The three may be given in **any order**. The historical `chuk_mcp`
+    /// order is `(name, handler, schema, description)` and the Rust core's is
+    /// `(name, schema, description, handler)`; rather than make one of them
+    /// wrong, both are accepted — a callable can only be the handler, a
+    /// mapping can only be the schema, and a string can only be the
+    /// description, so there is nothing to guess at.
+    #[pyo3(signature = (name, handler=None, schema=None, description=None))]
     fn register_tool(
         &self,
         py: Python<'_>,
         name: &str,
-        handler: Py<PyAny>,
-        schema: Bound<'_, PyAny>,
-        description: &str,
+        handler: Option<Bound<'_, PyAny>>,
+        schema: Option<Bound<'_, PyAny>>,
+        description: Option<Bound<'_, PyAny>>,
     ) -> PyResult<()> {
-        let schema: Value = py_to_json(&schema)?;
-        let handler = Arc::new(handler);
+        let parts = ToolParts::resolve([handler, schema, description])?;
+        let schema: Value = py_to_json(&parts.schema)?;
+        let description = parts.description;
+        let description = description.as_str();
+        let handler = Arc::new(parts.handler.unbind());
 
         let mut guard = self.inner.blocking_lock_owned_or_py(py)?;
         let server = guard
@@ -472,24 +550,33 @@ impl PyMcpServer {
     }
 
     /// Register a resource. `handler` is an async callable returning a str.
-    #[pyo3(signature = (uri, handler, name="", description="", mime_type="text/plain"))]
+    ///
+    /// The handler may appear in any position — `chuk_mcp` puts it second and
+    /// the Rust core puts it last — because only it is callable. The remaining
+    /// strings fill `name`, `description` and `mime_type` in the order given.
+    #[pyo3(signature = (uri, handler=None, name=None, description=None, mime_type=None))]
     fn register_resource(
         &self,
         py: Python<'_>,
         uri: &str,
-        handler: Py<PyAny>,
-        name: &str,
-        description: &str,
-        mime_type: &str,
+        handler: Option<Bound<'_, PyAny>>,
+        name: Option<Bound<'_, PyAny>>,
+        description: Option<Bound<'_, PyAny>>,
+        mime_type: Option<Bound<'_, PyAny>>,
     ) -> PyResult<()> {
-        let handler = Arc::new(handler);
+        let parts = ResourceParts::resolve(
+            [handler, name, description, mime_type],
+            DEFAULT_RESOURCE_MIME_TYPE,
+        )?;
+        let (name, description, mime_type) = (parts.name, parts.description, parts.mime_type);
+        let handler = Arc::new(parts.handler.unbind());
 
         let mut guard = self.inner.blocking_lock_owned_or_py(py)?;
         let server = guard
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("Server already running"))?;
 
-        server.register_resource(uri, name, description, mime_type, move || {
+        server.register_resource(uri, &name, &description, &mime_type, move || {
             let handler = handler.clone();
             async move {
                 let future = Python::attach(|py| -> PyResult<_> {
@@ -567,6 +654,7 @@ fn chuk_mcp_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     streams::register(m)?;
     http::register(m)?;
     server::register(m)?;
+    m.add_function(wrap_pyfunction!(connect, m)?)?;
     m.add_function(wrap_pyfunction!(connect_to_server, m)?)?;
     m.add_function(wrap_pyfunction!(supported_versions, m)?)?;
     m.add_function(wrap_pyfunction!(connect_dual_stdio, m)?)?;
