@@ -25,10 +25,12 @@ use chuk_mcp::transports::stdio_dual::{stdio_client_dual, StdioDualOptions};
 
 mod arguments;
 mod http;
+mod input;
 mod server;
 mod streams;
 mod types;
 use arguments::{ResourceParts, ToolParts};
+use input::PythonInputHandler;
 
 /// The mime type a resource is assumed to serve when none is given.
 const DEFAULT_RESOURCE_MIME_TYPE: &str = "text/plain";
@@ -367,6 +369,8 @@ impl PyMcpClient {
     env=None,
     timeout=None,
     credential_context=None,
+    on_elicit=None,
+    url_mode=false,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn connect<'py>(
@@ -378,6 +382,8 @@ fn connect<'py>(
     env: Option<HashMap<String, String>>,
     timeout: Option<f64>,
     credential_context: Option<String>,
+    on_elicit: Option<Py<PyAny>>,
+    url_mode: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     let mode: EraMode = era.parse().map_err(to_py_err)?;
 
@@ -397,6 +403,9 @@ fn connect<'py>(
         }
         if let Some(context) = credential_context {
             builder = builder.credential_context(context);
+        }
+        if let Some(callback) = on_elicit {
+            builder = builder.input_handler(PythonInputHandler::into_handler(callback, url_mode));
         }
 
         let client = builder.connect().await.map_err(to_py_err)?;
@@ -653,6 +662,7 @@ fn chuk_mcp_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     types::register(m)?;
     streams::register(m)?;
     http::register(m)?;
+    input::register(m)?;
     server::register(m)?;
     m.add_function(wrap_pyfunction!(connect, m)?)?;
     m.add_function(wrap_pyfunction!(connect_to_server, m)?)?;

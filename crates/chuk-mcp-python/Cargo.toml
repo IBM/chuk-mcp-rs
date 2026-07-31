@@ -21,6 +21,8 @@ pythonize = "0.29"
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
 
 [features]
 # Enabled by maturin when building the Python extension (see pyproject.toml).

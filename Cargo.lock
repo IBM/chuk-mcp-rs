@@ -131,6 +131,7 @@ dependencies = [
 name = "chuk-mcp-python"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chuk-mcp",
  "pyo3",
  "pyo3-async-runtimes",
@@ -138,6 +139,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -74,6 +74,38 @@ Two older entry points remain for compatibility, both stdio-only:
 `connect_to_server(params)` performs the legacy handshake and nothing else, and
 `connect_dual_stdio(params, mode="auto")` detects the era. Prefer `connect`.
 
+## Answering a server that asks for input
+
+A server can need something from the user mid-call — a username, a
+confirmation, consent to open a URL. Pass a coroutine and it is answered in
+either era: the `2026-07-28` revision returns the question as a result and the
+call is retried with your answer attached, while a legacy server pushes the
+question mid-call. Your handler does not see the difference.
+
+```python
+from chuk_mcp_rs import connect, ElicitResult
+
+async def on_elicit(request):
+    print(request.message)          # why it is being asked
+    print(request.mode)             # "form" or "url"
+    print(request.requestedSchema)  # form mode: the shape of the answer
+    print(request.url)              # url mode: where to send the user
+    return ElicitResult.accept({"name": "octocat"})
+
+client = await connect("https://example.com/mcp", on_elicit=on_elicit)
+result = await client.call_tool("open_pull_request", {"repo": "chuk-mcp-rs"})
+```
+
+Return `ElicitResult.accept(content)`, `.decline()` or `.cancel()` — or a plain
+dict of the same shape. A user who says no is not an error. Returning `None`,
+or raising, is read as a cancellation: neither is a decision the user made.
+
+Setting `on_elicit` also declares the `elicitation` capability, because a server
+must not ask a client that has not said it can answer. Pass `url_mode=True`
+only if you can actually open a URL for the user — a server is then permitted
+to send URL-mode requests, and a handler that cannot service them will simply
+have to decline every one.
+
 ## Typed results
 
 Results are objects, not dicts. Attribute names follow the wire where the wire
