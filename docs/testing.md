@@ -83,12 +83,12 @@ now passes**, so the known-gaps list is empty; the script still prints the
 section, so a new entry is visible the moment one appears.
 
 Server-side reference scenarios **now run**, against `chuk-mcp-conformance-server`
-over the HTTP serving mode. Reported, not blocking: **6 of 31 pass** today —
-`server-initialize`, `ping`, `tools-list`, `resources-list` and
-`server-sse-multiple-streams` — which is the lifecycle working end to end. The
-rest need server features that do not exist yet: prompts are not implemented at
-all, and neither are subscriptions, server-initiated sampling, or the richer
-content types (audio, images, embedded resources) several scenarios call for. The in-repo
+over the HTTP serving mode. Reported, not blocking: **7 of 31 pass** today —
+`server-initialize`, `ping`, `tools-list`, `resources-list`, `prompts-list` and
+`server-sse-multiple-streams`. The rest need either server features that do not
+exist (subscriptions, server-initiated sampling, richer content types like
+audio, images and embedded resources) or fixtures shaped to what each scenario
+expects to find registered. The in-repo
 suite covers the server's behaviour meanwhile. The upstream draft
 (`2026-07-28`) client scenarios are auth-only, which is why the modern era is
 covered in-repo rather than upstream.

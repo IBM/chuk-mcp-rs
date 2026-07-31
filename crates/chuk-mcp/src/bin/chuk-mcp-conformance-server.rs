@@ -72,6 +72,25 @@ fn conformance_server() -> McpServer {
         },
     );
 
+    server.register_prompt(
+        "summarise",
+        "Summarise a topic",
+        vec![
+            chuk_mcp::server::prompts::prompt_argument("topic", "What to summarise", true),
+            chuk_mcp::server::prompts::prompt_argument("style", "How to write it", false),
+        ],
+        |arguments| async move {
+            let topic = arguments
+                .get("topic")
+                .and_then(Value::as_str)
+                .unwrap_or("nothing in particular");
+            Ok(vec![chuk_mcp::server::prompts::text_message(
+                "user",
+                format!("Please summarise {topic}."),
+            )])
+        },
+    );
+
     server.register_resource(
         "conformance://motd",
         "motd",

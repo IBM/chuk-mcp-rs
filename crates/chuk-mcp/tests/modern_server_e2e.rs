@@ -15,13 +15,15 @@ use chuk_mcp::protocol::messages::method::MessageMethod;
 use chuk_mcp::protocol::messages::result_envelope::RESULT_TYPE_COMPLETE;
 use chuk_mcp::protocol::types::capabilities::{ServerCapabilities, ToolsCapability};
 use chuk_mcp::protocol::versioning;
-use chuk_mcp::server::{modern, McpServer};
+use chuk_mcp::server::{modern, prompts, McpServer};
 
 const TOOL_NAME: &str = "greet";
 const TOOL_ARGUMENT: &str = "name";
 const SERVER_NAME: &str = "modern-server";
 const SERVER_VERSION: &str = "2.0.0";
 const INSTRUCTIONS: &str = "Call greet before anything else.";
+const PROMPT_NAME: &str = "summarise";
+const PROMPT_ARGUMENT: &str = "topic";
 
 fn server() -> McpServer {
     let capabilities = ServerCapabilities {
@@ -48,6 +50,25 @@ fn server() -> McpServer {
                 .and_then(|value| value.as_str())
                 .unwrap_or("world");
             Ok(json!(format!("Hello, {name}!")))
+        },
+    );
+    server.register_prompt(
+        PROMPT_NAME,
+        "Summarise a topic",
+        vec![
+            prompts::prompt_argument(PROMPT_ARGUMENT, "What to summarise", true),
+            prompts::prompt_argument("style", "How to write it", false),
+        ],
+        |arguments| async move {
+            let topic = arguments
+                .get(PROMPT_ARGUMENT)
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            Ok(vec![prompts::text_message(
+                "user",
+                format!("Summarise {topic}"),
+            )])
         },
     );
     server
@@ -189,4 +210,79 @@ async fn a_modern_tool_call_round_trips() {
     assert_eq!(tool_result.result_type, RESULT_TYPE_COMPLETE);
     assert!(!tool_result.is_error);
     assert!(tool_result.text().contains("Hello, modern!"));
+}
+
+#[tokio::test]
+async fn prompts_are_listed_and_rendered() {
+    let server = server();
+
+    let listed = modern_call(&server, MessageMethod::PROMPTS_LIST, json!({})).await;
+    let prompts = listed["prompts"].as_array().expect("a prompts array");
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0]["name"], json!(PROMPT_NAME));
+    assert_eq!(prompts[0]["arguments"][0]["required"], json!(true));
+
+    let rendered = modern_call(
+        &server,
+        MessageMethod::PROMPTS_GET,
+        json!({"name": PROMPT_NAME, "arguments": {PROMPT_ARGUMENT: "otters"}}),
+    )
+    .await;
+
+    // Read through the client's own typed result.
+    let result: chuk_mcp::protocol::messages::prompts::GetPromptResult =
+        serde_json::from_value(rendered).expect("the client decodes it");
+    let messages = result.messages.expect("messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].content["text"], json!("Summarise otters"));
+    assert_eq!(result.result_type, RESULT_TYPE_COMPLETE);
+}
+
+#[tokio::test]
+async fn a_prompt_missing_a_required_argument_says_which() {
+    let request = JsonRpcMessage::Request(create_request(
+        MessageMethod::PROMPTS_GET,
+        Some(modern::params_with_version(
+            versioning::FIRST_MODERN_VERSION,
+            json!({"name": PROMPT_NAME, "arguments": {}}),
+        )),
+        Some(RequestId::Str("missing-argument".into())),
+        None,
+    ));
+
+    let (response, _session) = server().handle_message(request, None).await;
+    let error = response
+        .expect("the server answered")
+        .error()
+        .cloned()
+        .expect("an error");
+
+    // Naming it is the difference between a caller fixing the call and
+    // guessing at which of several arguments was wrong.
+    assert!(
+        error.message.contains(PROMPT_ARGUMENT),
+        "unhelpful error: {}",
+        error.message
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_prompt_is_refused() {
+    let request = JsonRpcMessage::Request(create_request(
+        MessageMethod::PROMPTS_GET,
+        Some(modern::params_with_version(
+            versioning::FIRST_MODERN_VERSION,
+            json!({"name": "no-such-prompt"}),
+        )),
+        Some(RequestId::Str("unknown-prompt".into())),
+        None,
+    ));
+
+    let (response, _session) = server().handle_message(request, None).await;
+    let error = response
+        .expect("the server answered")
+        .error()
+        .cloned()
+        .expect("an error");
+    assert!(error.message.contains("no-such-prompt"));
 }

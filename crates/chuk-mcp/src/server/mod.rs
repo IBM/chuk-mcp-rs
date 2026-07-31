@@ -3,6 +3,7 @@
 pub mod discover;
 pub mod http;
 pub mod modern;
+pub mod prompts;
 pub mod protocol_handler;
 pub mod session;
 
@@ -50,6 +51,7 @@ pub struct McpServer {
     pub protocol_handler: ProtocolHandler,
     tools: BTreeMap<String, RegisteredTool>,
     resources: BTreeMap<String, RegisteredResource>,
+    prompts: prompts::PromptRegistry,
     max_buffer_size: usize,
     /// Optional natural-language guidance for a model on using this server,
     /// returned by `server/discover`.
@@ -65,6 +67,7 @@ impl McpServer {
             protocol_handler: ProtocolHandler::new(server_info, capabilities),
             tools: BTreeMap::new(),
             resources: BTreeMap::new(),
+            prompts: prompts::PromptRegistry::new(),
             max_buffer_size: crate::transports::limits::DEFAULT_MAX_BUFFER_SIZE,
             instructions: None,
         }
@@ -189,6 +192,8 @@ impl McpServer {
             Some("tools/call") => (self.handle_tools_call(&message).await, None),
             Some("resources/list") => (self.handle_resources_list(&message), None),
             Some("resources/read") => (self.handle_resources_read(&message).await, None),
+            Some(MessageMethod::PROMPTS_LIST) => (self.handle_prompts_list(&message), None),
+            Some(MessageMethod::PROMPTS_GET) => (self.handle_prompts_get(&message).await, None),
             _ => {
                 self.protocol_handler
                     .handle_message(message, session_id)
@@ -210,6 +215,68 @@ impl McpServer {
                 self.instructions.as_deref(),
             )),
         ))
+    }
+
+    /// Register a prompt: a named template a model can ask to be rendered.
+    pub fn register_prompt<F, Fut>(
+        &mut self,
+        name: &str,
+        description: &str,
+        arguments: Vec<crate::protocol::messages::prompts::PromptArgument>,
+        handler: F,
+    ) where
+        F: Fn(serde_json::Map<String, Value>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<
+                Output = Result<Vec<crate::protocol::messages::prompts::PromptMessage>, String>,
+            > + Send
+            + 'static,
+    {
+        let handler = std::sync::Arc::new(handler);
+        self.prompts.insert(
+            name.to_string(),
+            prompts::RegisteredPrompt {
+                definition: crate::protocol::messages::prompts::Prompt {
+                    name: name.to_string(),
+                    description: Some(description.to_string()),
+                    arguments: (!arguments.is_empty()).then_some(arguments),
+                    extra: serde_json::Map::new(),
+                },
+                handler: std::sync::Arc::new(move |args| {
+                    let handler = handler.clone();
+                    Box::pin(async move { handler(args).await })
+                }),
+            },
+        );
+        tracing::debug!("Registered prompt: {name}");
+    }
+
+    fn handle_prompts_list(&self, message: &JsonRpcMessage) -> Option<JsonRpcMessage> {
+        let id = message.id()?.clone();
+        Some(
+            self.protocol_handler
+                .create_response(id, Some(prompts::list_result(&self.prompts))),
+        )
+    }
+
+    async fn handle_prompts_get(&self, message: &JsonRpcMessage) -> Option<JsonRpcMessage> {
+        let id = message.id()?.clone();
+        let params = protocol_handler::params_object(message);
+        let name = params
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let arguments = params
+            .get("arguments")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+
+        Some(
+            match prompts::get_result(&self.prompts, name, arguments).await {
+                Ok(result) => self.protocol_handler.create_response(id, Some(result)),
+                Err((code, text)) => self.protocol_handler.create_error_response(id, code, &text),
+            },
+        )
     }
 
     fn handle_tools_list(&self, message: &JsonRpcMessage) -> Option<JsonRpcMessage> {
