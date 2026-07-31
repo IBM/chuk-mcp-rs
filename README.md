@@ -12,7 +12,7 @@ between them.
 
 The Python package [`chuk-mcp`](https://github.com/chrishayuk/chuk-mcp)
 re-exports these bindings, so `import chuk_mcp` keeps working unchanged while
-being powered by Rust — [about 5.5× more tool calls per
+being powered by Rust — [about 5.8× more tool calls per
 second](benchmarks/README.md) than the last pure-Python release, with no code
 changes.
 
@@ -229,8 +229,6 @@ Name one yourself when you need to:
 | `transports::sse` | Legacy | The deprecated HTTP+SSE transport. |
 
 **Deeper:** [docs/transports.md](docs/transports.md).
-
----
 
 ---
 
