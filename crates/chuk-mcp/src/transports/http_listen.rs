@@ -61,6 +61,53 @@ const UNSUPPORTED: [u16; 3] = [404, 405, 501];
 /// something every exchange needs.
 pub(crate) const READY_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// What the streams have told us about resuming them, shared between the POST
+/// path and the listener.
+///
+/// A `retry:` or an event id can arrive on *any* stream — including the SSE
+/// response to a POST — and applies to the connection, not to the stream that
+/// carried it. Keeping them here is what lets a request whose stream ended
+/// early be resumed by the listener rather than lost.
+#[derive(Default)]
+pub(crate) struct StreamHints {
+    inner: std::sync::Mutex<Hints>,
+    resume: Notify,
+}
+
+#[derive(Default, Clone)]
+struct Hints {
+    last_event_id: Option<String>,
+    retry: Option<Duration>,
+}
+
+impl StreamHints {
+    /// Record what a finished stream said, and ask for a resume if it ended
+    /// without delivering the response it was opened for.
+    pub(crate) fn record(&self, stream: &crate::transports::http::SseStream) {
+        {
+            let mut hints = self.inner.lock().expect("hints lock");
+            if stream.last_event_id.is_some() {
+                hints.last_event_id = stream.last_event_id.clone();
+            }
+            if stream.retry.is_some() {
+                hints.retry = stream.retry;
+            }
+        }
+        if !stream.answered {
+            self.resume.notify_waiters();
+        }
+    }
+
+    fn snapshot(&self) -> Hints {
+        self.inner.lock().expect("hints lock").clone()
+    }
+
+    /// Resolve when a stream ends unanswered and wants resuming.
+    async fn resume_requested(&self) {
+        self.resume.notified().await;
+    }
+}
+
 /// Signals that the server-to-client stream has been settled — either opened,
 /// or established as unavailable.
 ///
@@ -105,15 +152,14 @@ pub(crate) async fn listen(
     incoming: mpsc::Sender<JsonRpcMessage>,
     max_buffer_size: usize,
     ready: Arc<Ready>,
+    hints: Arc<StreamHints>,
 ) {
     await_session(&session).await;
 
-    // Carried across reconnects: where this client got to, and how long the
-    // server last asked it to wait.
-    let mut last_event_id: Option<String> = None;
-    let mut reconnect_delay = RECONNECT_DELAY;
-
     loop {
+        // Read fresh each round: a POST stream that ended since the last
+        // attempt may have moved the resume point on.
+        let last_event_id = hints.snapshot().last_event_id;
         if incoming.is_closed() {
             ready.signal();
             return;
@@ -149,12 +195,17 @@ pub(crate) async fn listen(
                 ready.signal();
                 // Ends when the server closes the stream, which is ordinary:
                 // reconnect and keep listening.
-                let stream = stream_sse_response(response, &incoming, max_buffer_size).await;
-                if stream.last_event_id.is_some() {
-                    last_event_id = stream.last_event_id;
-                }
-                if let Some(retry) = stream.retry {
-                    reconnect_delay = retry;
+                // Race the stream against a resume request: a POST stream that
+                // ended unanswered wants this one reopened from its event id,
+                // and waiting for a server that is holding this stream open
+                // would never get there.
+                tokio::select! {
+                    stream = stream_sse_response(response, &incoming, max_buffer_size) => {
+                        hints.record(&stream);
+                    }
+                    _ = hints.resume_requested() => {
+                        tracing::debug!("resuming the server-to-client stream");
+                    }
                 }
             }
             Ok(response) => {
@@ -165,7 +216,12 @@ pub(crate) async fn listen(
             }
         }
 
-        tokio::time::sleep(reconnect_delay).await;
+        // Read the delay *after* the stream ended, not before it started: the
+        // `retry:` that governs this reconnection usually arrives on the very
+        // stream that just closed, so a value sampled earlier is the previous
+        // instruction rather than the current one.
+        let delay = hints.snapshot().retry.unwrap_or(RECONNECT_DELAY);
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -183,6 +239,78 @@ async fn await_session(session: &Arc<std::sync::Mutex<Option<String>>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::transports::http::SseStream;
+
+    fn stream(id: Option<&str>, retry: Option<u64>, answered: bool) -> SseStream {
+        SseStream {
+            last_event_id: id.map(str::to_string),
+            retry: retry.map(Duration::from_millis),
+            answered,
+        }
+    }
+
+    #[test]
+    fn hints_accumulate_and_never_regress_to_nothing() {
+        let hints = StreamHints::default();
+        assert!(hints.snapshot().last_event_id.is_none());
+        assert!(hints.snapshot().retry.is_none());
+
+        hints.record(&stream(Some("event-2"), Some(500), true));
+        assert_eq!(hints.snapshot().last_event_id.as_deref(), Some("event-2"));
+        assert_eq!(hints.snapshot().retry, Some(Duration::from_millis(500)));
+
+        // A later stream that says nothing must not erase where we got to:
+        // resuming from the start would replay everything already seen.
+        hints.record(&stream(None, None, true));
+        assert_eq!(hints.snapshot().last_event_id.as_deref(), Some("event-2"));
+        assert_eq!(hints.snapshot().retry, Some(Duration::from_millis(500)));
+
+        // A newer position does replace the old one.
+        hints.record(&stream(Some("event-9"), None, true));
+        assert_eq!(hints.snapshot().last_event_id.as_deref(), Some("event-9"));
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_stream_asks_to_be_resumed() {
+        let hints = Arc::new(StreamHints::default());
+
+        // Nothing is waiting yet, so this must not deadlock a later waiter.
+        hints.record(&stream(Some("event-1"), None, true));
+
+        let waiting = hints.clone();
+        let resumed = tokio::spawn(async move { waiting.resume_requested().await });
+        tokio::task::yield_now().await;
+
+        // Answered: no resume. Unanswered: resume.
+        hints.record(&stream(Some("event-2"), None, true));
+        tokio::task::yield_now().await;
+        assert!(
+            !resumed.is_finished(),
+            "an answered stream asked for a resume"
+        );
+
+        hints.record(&stream(Some("event-3"), None, false));
+        tokio::time::timeout(Duration::from_secs(1), resumed)
+            .await
+            .expect("an unanswered stream must ask to be resumed")
+            .expect("the waiter completes");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn readiness_is_settled_only_once_and_releases_waiters() {
+        let ready = Arc::new(Ready::default());
+        let waiting = ready.clone();
+        let released = tokio::spawn(async move { waiting.wait().await });
+        tokio::task::yield_now().await;
+
+        ready.signal();
+        released.await.expect("the waiter is released");
+
+        // Already settled: a later wait returns at once rather than waiting out
+        // the timeout.
+        ready.wait().await;
+    }
 
     #[test]
     fn unsupported_statuses_are_the_ones_that_mean_no_stream() {

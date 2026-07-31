@@ -27,14 +27,17 @@ CLIENT_VERSIONS=("2025-06-18" "2025-11-25")
 
 # Scenarios that exist only at a single version, as "scenario:version".
 # Also blocking.
-PINNED_SCENARIOS=("elicitation-sep1034-client-defaults:2025-11-25")
+PINNED_SCENARIOS=(
+  "elicitation-sep1034-client-defaults:2025-11-25"
+  "sse-retry:2025-11-25"
+)
 
 # Scenarios needing client features we have not built yet, as
 # "scenario:version:what is missing". Reported, never fatal — the point is to
 # keep the gap visible rather than to fail a build over known work.
-KNOWN_GAPS=(
-  "sse-retry:2025-11-25:honouring the SSE retry field and sending Last-Event-ID on reconnect"
-)
+# Empty: every client scenario the suite offers at a version we support now
+# passes. Entries take the form "scenario:version:what is missing".
+KNOWN_GAPS=()
 
 RUN_GAPS=0
 for arg in "$@"; do
@@ -95,7 +98,7 @@ done
 echo
 if [ "$RUN_GAPS" -eq 1 ]; then
   echo "== known gaps (reported, non-blocking) =="
-  for entry in "${KNOWN_GAPS[@]}"; do
+  for entry in ${KNOWN_GAPS[@]+"${KNOWN_GAPS[@]}"}; do
     IFS=':' read -r sc ver missing <<< "$entry"
     echo "-- ${sc} @ ${ver} — needs: ${missing}"
     if npx --yes "$CONFORMANCE" client \
@@ -106,8 +109,12 @@ if [ "$RUN_GAPS" -eq 1 ]; then
     fi
   done
 else
-  echo "Known gaps not run (pass --gaps to check them):"
-  for entry in "${KNOWN_GAPS[@]}"; do
+  if [ ${#KNOWN_GAPS[@]} -eq 0 ]; then
+    echo "No known client-scenario gaps."
+  else
+    echo "Known gaps not run (pass --gaps to check them):"
+  fi
+  for entry in ${KNOWN_GAPS[@]+"${KNOWN_GAPS[@]}"}; do
     IFS=':' read -r sc ver missing <<< "$entry"
     echo "  ${sc} @ ${ver} — needs: ${missing}"
   done

@@ -296,6 +296,9 @@ async fn send_legacy(
     message: JsonRpcMessage,
     max_buffer_size: usize,
 ) {
+    // No listener on the dual transport: the modern era has no
+    // server-to-client stream to resume, and a legacy peer reached this way is
+    // driven request-by-request.
     http::send_via_http(
         client,
         &params.legacy(),
@@ -303,6 +306,7 @@ async fn send_legacy(
         incoming_tx,
         message,
         max_buffer_size,
+        None,
     )
     .await;
 }

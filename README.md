@@ -289,13 +289,14 @@ only, and an unimplemented era belongs in the matrix as an absence rather than
 hidden behind rules nobody wrote.
 
 **The official `@modelcontextprotocol/conformance` suite**, driving our client
-as a black box — `initialize` and `tools_call` pass for both `2025-06-18` and
-`2025-11-25`, and `elicitation-sep1034-client-defaults` passes at `2025-11-25`.
+as a black box. **Every client scenario it offers at a version we support
+passes** — `initialize` and `tools_call` at both `2025-06-18` and `2025-11-25`,
+plus `elicitation-sep1034-client-defaults` and `sse-retry` at `2025-11-25`.
 
-One scenario is reported as a known gap rather than passed over: `sse-retry`
-needs the SSE `retry:` field honoured and `Last-Event-ID` sent on reconnect.
 Server-side reference scenarios cannot run at all — the suite drives servers
-over `--url` and this crate has no HTTP serving mode yet.
+over `--url` and this crate has no HTTP serving mode yet. The upstream draft
+(`2026-07-28`) client scenarios are auth-only, which is why the modern era is
+covered by the in-repo suite instead.
 
 Details: [docs/testing.md](docs/testing.md).
 
@@ -326,8 +327,8 @@ Wire compatibility is verified in both directions against the Python
 `chuk_mcp` implementation, and against the official
 `@modelcontextprotocol/conformance` client scenarios in CI.
 
-Known gaps, all tracked: a modern-era server, SSE GET reconnection, and
-client-side elicitation. `scripts/run-conformance.sh` prints them.
+Known gaps, all tracked: a modern-era server, and an HTTP serving mode for it.
+`scripts/run-conformance.sh` prints the current state.
 
 ---
 

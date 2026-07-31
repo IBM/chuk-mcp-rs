@@ -76,17 +76,10 @@ and it appears in the matrix. Nothing else needs touching.
 ```
 
 Blocking today: `initialize` and `tools_call` for `2025-06-18` and
-`2025-11-25`, plus `elicitation-sep1034-client-defaults` at `2025-11-25`.
-
-One known gap, reported but never fatal — the script tells you if it starts
-passing:
-
-| Scenario | Needs |
-| --- | --- |
-| `sse-retry` | Honouring the SSE `retry:` field and sending `Last-Event-ID` on reconnect |
-
-Both are parsed and carried across reconnects already; what remains is that the
-scenario's own stream never reaches the branch that uses them.
+`2025-11-25`, plus `elicitation-sep1034-client-defaults` and `sse-retry` at
+`2025-11-25`. **Every client scenario the suite offers at a version we support
+now passes**, so the known-gaps list is empty; the script still prints the
+section, so a new entry is visible the moment one appears.
 
 Server-side reference scenarios cannot run: the official suite drives a server
 over `--url`, and this crate's server has no HTTP serving mode. The in-repo
