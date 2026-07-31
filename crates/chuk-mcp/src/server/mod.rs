@@ -1,6 +1,7 @@
 //! High-level MCP server, mirroring `chuk_mcp.server`.
 
 pub mod discover;
+pub mod http;
 pub mod modern;
 pub mod protocol_handler;
 pub mod session;

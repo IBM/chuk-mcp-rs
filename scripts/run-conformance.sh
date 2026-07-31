@@ -8,9 +8,11 @@
 # Stage 3  known gaps       — reference scenarios we do not pass yet. Opt-in
 #                             (--gaps); reported, never fatal.
 #
-# Server-side reference scenarios are not run: the official suite drives a
-# server over `--url`, and this crate's server has no HTTP serving mode yet
-# (stdio only). Stage 1 covers the server's behaviour in the meantime.
+# Stage 4  official server  — the reference server scenarios. Reported, not
+#                             blocking: the lifecycle passes but several
+#                             scenarios need server features (prompts,
+#                             subscriptions, sampling, richer content types)
+#                             that are not built yet.
 #
 # The draft (2026-07-28) client scenarios upstream are auth-only, so the modern
 # era is covered by stage 1 rather than by the reference suite.
@@ -38,6 +40,8 @@ PINNED_SCENARIOS=(
 # Empty: every client scenario the suite offers at a version we support now
 # passes. Entries take the form "scenario:version:what is missing".
 KNOWN_GAPS=()
+
+SERVER_BIND="127.0.0.1:8930"
 
 RUN_GAPS=0
 for arg in "$@"; do
@@ -119,6 +123,21 @@ else
     echo "  ${sc} @ ${ver} — needs: ${missing}"
   done
 fi
+
+# --- Stage 4: the official server scenarios --------------------------------
+
+echo
+echo "== official server scenarios (reported, non-blocking) =="
+cargo build --quiet --manifest-path "$ROOT/Cargo.toml" --bin chuk-mcp-conformance-server
+"$ROOT/target/debug/chuk-mcp-conformance-server" "$SERVER_BIND" >/dev/null 2>&1 &
+server_pid=$!
+sleep 2
+
+npx --yes "$CONFORMANCE" server \
+  --url "http://${SERVER_BIND}/mcp" --spec-version 2025-11-25 2>&1 | tail -3
+
+kill "$server_pid" 2>/dev/null
+wait "$server_pid" 2>/dev/null
 
 # --- Summary ---------------------------------------------------------------
 

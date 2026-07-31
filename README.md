@@ -322,10 +322,14 @@ as a black box. **Every client scenario it offers at a version we support
 passes** — `initialize` and `tools_call` at both `2025-06-18` and `2025-11-25`,
 plus `elicitation-sep1034-client-defaults` and `sse-retry` at `2025-11-25`.
 
-Server-side reference scenarios cannot run at all — the suite drives servers
-over `--url` and this crate has no HTTP serving mode yet. The upstream draft
-(`2026-07-28`) client scenarios are auth-only, which is why the modern era is
-covered by the in-repo suite instead.
+Server-side reference scenarios now run too, against the HTTP serving mode —
+**6 of 31** pass, which is the lifecycle (`server-initialize`, `ping`,
+`tools-list`, `resources-list`, SSE streams) working end to end. The rest need
+server features not yet built: prompts, subscriptions, server-initiated
+sampling, and richer content types. Reported by the script, not blocking.
+
+The upstream draft (`2026-07-28`) client scenarios are auth-only, which is why
+the modern era is covered by the in-repo suite instead.
 
 Details: [docs/testing.md](docs/testing.md).
 
@@ -350,15 +354,15 @@ Full-parity port of the Python package's public surface.
 - **Transports** — stdio, Streamable HTTP in both shapes, the dual-era transports, and the deprecated HTTP+SSE transport.
 - **`2026-07-28`** — per-request `_meta`, mirrored `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` headers, `x-mcp-header` parameter promotion, `server/discover`, era detection and caching, new-request-ID retry on a broken response stream, and the typed result envelope.
 - **Client** — `McpClient`, on any transport, in either era.
-- **Server** — `McpServer` with tool/resource registration, a protocol handler, and in-memory sessions. Answers **both** eras: `server/discover`, per-request version checking and `resultType` stamping for modern callers, the `initialize` lifecycle for legacy ones.
+- **Server** — `McpServer` with tool/resource registration, a protocol handler, and in-memory sessions, served over **stdio or Streamable HTTP**. Answers **both** eras: `server/discover`, per-request version checking and `resultType` stamping for modern callers, the `initialize` lifecycle for legacy ones.
 
 Wire compatibility is verified in both directions against the Python
 `chuk_mcp` implementation, and against the official
 `@modelcontextprotocol/conformance` client scenarios in CI.
 
-Known gap: no HTTP **serving** mode, which is what the official suite's
-server-side scenarios need (they drive a server over `--url`). The server is
-stdio-served today. `scripts/run-conformance.sh` prints the current state.
+Known gaps: the server has no prompts, subscriptions, server-initiated
+sampling, or richer content types, which is what the remaining official server
+scenarios exercise. `scripts/run-conformance.sh` prints the current state.
 
 ---
 
