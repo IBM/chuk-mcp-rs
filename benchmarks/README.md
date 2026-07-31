@@ -41,14 +41,18 @@ Apple M2 Pro, macOS 26.5.2, rustc 1.97.1, CPython 3.11.11 — 1000 calls to
 
 | Client | Handshake | Mean/call | Calls/sec | vs slowest | p50 | p95 | p99 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| rust-native | 4.7 ms | 55.2 µs | 18,107 | 9.1× | 57.0 µs | 72.6 µs | 85.9 µs |
-| python-bindings | 12.7 ms | 86.3 µs | 11,585 | 5.8× | 78.6 µs | 128.3 µs | 158.7 µs |
-| pure-python | 17.9 ms | 500.6 µs | 1,998 | 1.0× | 492.6 µs | 552.5 µs | 648.4 µs |
+| rust-native | 7.4 ms | 49.4 µs | 20,260 | 10.3× | 44.8 µs | 73.7 µs | 102.2 µs |
+| python-bindings | 12.0 ms | 84.4 µs | 11,855 | 6.0× | 81.1 µs | 108.4 µs | 125.7 µs |
+| pure-python | 13.1 ms | 507.6 µs | 1,970 | 1.0× | 498.6 µs | 567.4 µs | 691.2 µs |
 
 Reading it: a Python caller that switches to the Rust-backed package gets
-roughly **5.8× more tool calls per second** without changing a line of code.
-Dropping Python entirely buys another 1.6×, which is the PyO3 boundary and
+roughly **6× more tool calls per second** without changing a line of code.
+Dropping Python entirely buys another 1.7×, which is the PyO3 boundary and
 the event loop — the protocol work is already identical.
+
+Measured after MRTR landed, so these include the `input_required` check every
+`tools/call` now makes on its way through the retry driver. It does not show:
+the cost is one field lookup against a result already parsed.
 
 Handshake covers spawning the server *and* the protocol exchange, so it is
 dominated by process start-up; treat it as a rough figure, not a protocol

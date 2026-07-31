@@ -12,7 +12,7 @@ between them.
 
 The Python package [`chuk-mcp`](https://github.com/chrishayuk/chuk-mcp)
 re-exports these bindings, so `import chuk_mcp` keeps working unchanged while
-being powered by Rust — [about 5.8× more tool calls per
+being powered by Rust — [about 6× more tool calls per
 second](benchmarks/README.md) than the last pure-Python release, with no code
 changes.
 
@@ -240,13 +240,13 @@ Same MCP server binary, same workload, three clients — 1000 `greet` calls afte
 
 | Client | Mean/call | Calls/sec | p50 | p95 | p99 | Handshake |
 | --- | --- | --- | --- | --- | --- | --- |
-| **rust-native** — the `chuk-mcp` crate | **55.2 µs** | **18,107** | 57.0 µs | 72.6 µs | 85.9 µs | 4.7 ms |
-| **python-bindings** — `chuk_mcp_rs` via PyO3 | 86.3 µs | 11,585 | 78.6 µs | 128.3 µs | 158.7 µs | 12.7 ms |
-| **pure-python** — `chuk-mcp==0.9.4` | 500.6 µs | 1,998 | 492.6 µs | 552.5 µs | 648.4 µs | 17.9 ms |
+| **rust-native** — the `chuk-mcp` crate | **49.4 µs** | **20,260** | 44.8 µs | 73.7 µs | 102.2 µs | 7.4 ms |
+| **python-bindings** — `chuk_mcp_rs` via PyO3 | 84.4 µs | 11,855 | 81.1 µs | 108.4 µs | 125.7 µs | 12.0 ms |
+| **pure-python** — `chuk-mcp==0.9.4` | 507.6 µs | 1,970 | 498.6 µs | 567.4 µs | 691.2 µs | 13.1 ms |
 
-A Python caller that switches to the Rust-backed package gets **5.8× more tool
+A Python caller that switches to the Rust-backed package gets **6× more tool
 calls per second without changing a line of code**. Dropping Python entirely
-buys another 1.6× — that gap is the PyO3 boundary and the event loop, since the
+buys another 1.7× — that gap is the PyO3 boundary and the event loop, since the
 protocol work is already the same code.
 
 The baseline is pinned to `chuk-mcp==0.9.4` deliberately: it is the last release
@@ -257,13 +257,13 @@ Per-message protocol costs, from `cargo bench -p chuk-mcp`:
 
 | | |
 | --- | --- |
-| Parse a `tools/call` request | 1.77 µs |
-| Serialize a request | 1.25 µs |
-| Build a `2026-07-28` envelope (`_meta` + mirrored headers) | 1.29 µs |
-| …and promote `x-mcp-header` parameters | 2.13 µs |
+| Parse a `tools/call` request | 1.76 µs |
+| Serialize a request | 1.24 µs |
+| Build a `2026-07-28` envelope (`_meta` + mirrored headers) | 1.27 µs |
+| …and promote `x-mcp-header` parameters | 2.11 µs |
 | Classify an HTTP response as modern | 1.2 ns |
 | Decode a tool result | 1.66 µs |
-| Negotiate a protocol version | 38.8 ns |
+| Negotiate a protocol version | 38.7 ns |
 
 Method and caveats: [benchmarks/README.md](benchmarks/README.md).
 

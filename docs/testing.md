@@ -108,16 +108,16 @@ Apple M2 Pro, rustc 1.97.1:
 
 | | |
 | --- | --- |
-| Parse a `tools/call` request | 1.77 µs |
-| Parse a `tools/call` response | 3.46 µs |
-| Serialize a request | 1.25 µs |
-| Build a modern envelope | 1.29 µs |
-| Build and promote parameters | 2.13 µs |
-| Encode a header value (plain / Base64) | 31.6 ns / 176 ns |
-| Negotiate a protocol version | 38.8 ns |
+| Parse a `tools/call` request | 1.76 µs |
+| Parse a `tools/call` response | 3.47 µs |
+| Serialize a request | 1.24 µs |
+| Build a modern envelope | 1.27 µs |
+| Build and promote parameters | 2.11 µs |
+| Encode a header value (plain / Base64) | 31.6 ns / 177 ns |
+| Negotiate a protocol version | 38.7 ns |
 | Classify an HTTP response as modern | 1.2 ns |
 | Decode a tool result | 1.66 µs |
-| Decode a 32-tool catalogue | 43.7 µs |
+| Decode a 32-tool catalogue | 43.8 µs |
 
 CI compiles the benchmarks but does not run them — the numbers would be noise
 on a shared runner.
