@@ -27,6 +27,15 @@ pub trait Transport: Send + Sync {
     /// Set the negotiated protocol version (used e.g. for batching rules).
     fn set_protocol_version(&self, _version: &str) {}
 
+    /// Wait until any background streams this transport needs are established.
+    ///
+    /// Streamable HTTP carries server-initiated requests on a separate `GET`
+    /// stream, and a server will not ask for input on a stream that does not
+    /// exist yet — so a client that starts work the instant the handshake
+    /// returns can lose a race it did not know it was in. Transports with no
+    /// such stream are ready as soon as they are started.
+    async fn ready(&self) {}
+
     /// Shut the transport down, terminating any subprocess/connections.
     async fn close(&mut self) -> Result<(), McpError> {
         Ok(())

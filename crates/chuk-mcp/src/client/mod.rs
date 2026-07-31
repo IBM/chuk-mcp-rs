@@ -166,6 +166,12 @@ impl McpClient {
             .set_protocol_version(&result.protocol_version);
         self.streams = Some((read, write));
 
+        // A server may only ask for input on a stream that already exists, so
+        // work started the instant the handshake returns can lose a race it
+        // did not know it was in. Transports with no such stream return at
+        // once.
+        self.transport.ready().await;
+
         tracing::info!("Initialized connection to {}", result.server_info.name);
         Ok(result)
     }

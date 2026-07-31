@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::{mpsc, Semaphore};
@@ -95,6 +96,8 @@ impl StreamableHttpParameters {
 /// Streamable HTTP transport: POSTs each message; handles both immediate JSON
 /// responses and SSE-streamed responses.
 pub struct StreamableHttpTransport {
+    /// Settled once the server-to-client stream is up, or known absent.
+    ready: Arc<super::http_listen::Ready>,
     incoming: ReadStream,
     outgoing: WriteStream,
     session_id: Arc<std::sync::Mutex<Option<String>>>,
@@ -129,12 +132,14 @@ impl StreamableHttpTransport {
         // The server-to-client stream. Spawned here rather than on demand
         // because a server may push before the client asks for anything, and
         // nothing else in this transport is listening for it.
+        let ready = Arc::new(super::http_listen::Ready::default());
         tokio::spawn(super::http_listen::listen(
             client.clone(),
             parameters.clone(),
             session_id.clone(),
             incoming_tx.clone(),
             max_buffer_size,
+            ready.clone(),
         ));
 
         let task = tokio::spawn(async move {
@@ -164,6 +169,7 @@ impl StreamableHttpTransport {
             outgoing,
             session_id,
             task: Some(task),
+            ready,
         })
     }
 
@@ -307,13 +313,27 @@ async fn route_error(
     }
 }
 
+/// What an SSE stream told us about reconnecting to it.
+///
+/// Both fields are the server's instructions, not our policy: `retry` is how
+/// long it wants us to wait, and `last_event_id` is where it should resume us
+/// from. Ignoring either turns a reconnect into a thundering herd or a gap in
+/// the message history.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct SseStream {
+    /// The id of the last event carrying one, for `Last-Event-ID` on reconnect.
+    pub last_event_id: Option<String>,
+    /// The reconnection delay the server asked for, via a `retry:` field.
+    pub retry: Option<Duration>,
+}
+
 /// Stream and parse an SSE response body, routing JSON-RPC messages.
 pub(crate) async fn stream_sse_response(
     response: reqwest::Response,
     incoming_tx: &mpsc::Sender<JsonRpcMessage>,
     max_buffer_size: usize,
-) {
-    process_sse_stream(response.bytes_stream(), incoming_tx, max_buffer_size).await;
+) -> SseStream {
+    process_sse_stream(response.bytes_stream(), incoming_tx, max_buffer_size).await
 }
 
 /// Core SSE event loop, generic over the byte stream so tests can drive it
@@ -322,11 +342,14 @@ async fn process_sse_stream<S, B, E>(
     mut stream: S,
     incoming_tx: &mpsc::Sender<JsonRpcMessage>,
     max_buffer_size: usize,
-) where
+) -> SseStream
+where
     S: futures::Stream<Item = Result<B, E>> + Unpin,
     B: AsRef<[u8]>,
 {
     use futures::StreamExt;
+
+    let mut state = SseStream::default();
 
     // Buffer bytes rather than text: a multi-byte character split across
     // chunks must not be decoded until its event is complete.
@@ -338,7 +361,12 @@ async fn process_sse_stream<S, B, E>(
         // Process complete events (separated by blank lines).
         while let Some(pos) = find_event_boundary(&buffer) {
             let event_bytes: Vec<u8> = buffer.drain(..pos).collect();
-            process_sse_event_text(&String::from_utf8_lossy(&event_bytes), incoming_tx).await;
+            process_sse_event_text(
+                &String::from_utf8_lossy(&event_bytes),
+                incoming_tx,
+                &mut state,
+            )
+            .await;
         }
 
         // A server that never completes an event would otherwise grow this
@@ -350,14 +378,15 @@ async fn process_sse_stream<S, B, E>(
                 "{}",
                 too_large_error(buffer.len(), max_buffer_size, "SSE event")
             );
-            return;
+            return state;
         }
     }
     // Trailing event without final blank line.
-    let trailing = String::from_utf8_lossy(&buffer);
+    let trailing = String::from_utf8_lossy(&buffer).to_string();
     if !trailing.trim().is_empty() {
-        process_sse_event_text(&trailing, incoming_tx).await;
+        process_sse_event_text(&trailing, incoming_tx, &mut state).await;
     }
+    state
 }
 
 /// Find the end of the first complete SSE event (blank-line separator),
@@ -376,14 +405,19 @@ fn find_event_boundary(buffer: &[u8]) -> Option<usize> {
 
 /// Parse a fully-loaded SSE body.
 async fn parse_sse_text(text: &str, incoming_tx: &mpsc::Sender<JsonRpcMessage>) {
+    let mut state = SseStream::default();
     for event_text in text.split("\n\n") {
-        process_sse_event_text(event_text, incoming_tx).await;
+        process_sse_event_text(event_text, incoming_tx, &mut state).await;
     }
 }
 
 /// Process one SSE event's raw text: extract `data:` lines and route
 /// message-bearing events.
-async fn process_sse_event_text(event_text: &str, incoming_tx: &mpsc::Sender<JsonRpcMessage>) {
+async fn process_sse_event_text(
+    event_text: &str,
+    incoming_tx: &mpsc::Sender<JsonRpcMessage>,
+    state: &mut SseStream,
+) {
     let mut event_type: Option<&str> = None;
     let mut data_lines: Vec<&str> = Vec::new();
 
@@ -393,6 +427,14 @@ async fn process_sse_event_text(event_text: &str, incoming_tx: &mpsc::Sender<Jso
             event_type = Some(rest.trim());
         } else if let Some(rest) = line.strip_prefix("data:") {
             data_lines.push(rest.strip_prefix(' ').unwrap_or(rest));
+        } else if let Some(rest) = line.strip_prefix("id:") {
+            // Recorded even on an event carrying no data: the id marks a
+            // position in the stream, not a message.
+            state.last_event_id = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("retry:") {
+            if let Ok(millis) = rest.trim().parse::<u64>() {
+                state.retry = Some(Duration::from_millis(millis));
+            }
         }
     }
 
@@ -415,6 +457,10 @@ async fn process_sse_event_text(event_text: &str, incoming_tx: &mpsc::Sender<Jso
 
 #[async_trait]
 impl Transport for StreamableHttpTransport {
+    async fn ready(&self) {
+        self.ready.wait().await;
+    }
+
     async fn get_streams(&self) -> Result<(ReadStream, WriteStream), McpError> {
         Ok((self.incoming.clone(), self.outgoing.clone()))
     }
@@ -498,6 +544,45 @@ mod tests {
         // The complete event ahead of the oversized tail was still routed.
         assert!(matches!(rx.try_recv(), Ok(JsonRpcMessage::Response(_))));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn an_sse_stream_reports_its_id_and_retry_instructions() {
+        // Both are the server's instructions for reconnecting: where to resume
+        // from, and how long to wait. Dropping either turns a reconnect into a
+        // gap in the history or a thundering herd.
+        let (tx, _rx) = mpsc::channel(8);
+        let body = "id: 42\nretry: 500\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n";
+        let stream = futures::stream::iter(vec![Ok::<_, std::io::Error>(body.as_bytes())]);
+
+        let state = process_sse_stream(stream, &tx, 0).await;
+        assert_eq!(state.last_event_id.as_deref(), Some("42"));
+        assert_eq!(state.retry, Some(Duration::from_millis(500)));
+    }
+
+    #[tokio::test]
+    async fn an_event_id_is_recorded_even_without_data() {
+        // An id marks a position in the stream, not a message: a keepalive
+        // carrying one still moves the resume point forward.
+        let (tx, _rx) = mpsc::channel(8);
+        let stream = futures::stream::iter(vec![Ok::<_, std::io::Error>("id: 7\n\n".as_bytes())]);
+
+        let state = process_sse_stream(stream, &tx, 0).await;
+        assert_eq!(state.last_event_id.as_deref(), Some("7"));
+        assert_eq!(state.retry, None);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_retry_is_ignored_rather_than_guessed() {
+        let (tx, _rx) = mpsc::channel(8);
+        let stream =
+            futures::stream::iter(vec![Ok::<_, std::io::Error>("retry: soon\n\n".as_bytes())]);
+
+        let state = process_sse_stream(stream, &tx, 0).await;
+        assert_eq!(
+            state.retry, None,
+            "a non-numeric retry must not set a delay"
+        );
     }
 
     #[tokio::test]

@@ -21,16 +21,19 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CONFORMANCE="@modelcontextprotocol/conformance@0.1.16"
 
-# Scenarios our client passes. These block the run.
+# Scenarios our client passes at every version below. These block the run.
 CLIENT_SCENARIOS=("initialize" "tools_call")
 CLIENT_VERSIONS=("2025-06-18" "2025-11-25")
+
+# Scenarios that exist only at a single version, as "scenario:version".
+# Also blocking.
+PINNED_SCENARIOS=("elicitation-sep1034-client-defaults:2025-11-25")
 
 # Scenarios needing client features we have not built yet, as
 # "scenario:version:what is missing". Reported, never fatal — the point is to
 # keep the gap visible rather than to fail a build over known work.
 KNOWN_GAPS=(
-  "sse-retry:2025-11-25:GET reconnection after a graceful SSE stream close"
-  "elicitation-sep1034-client-defaults:2025-11-25:handling server-initiated elicitation/create"
+  "sse-retry:2025-11-25:honouring the SSE retry field and sending Last-Event-ID on reconnect"
 )
 
 RUN_GAPS=0
@@ -75,6 +78,18 @@ for ver in "${CLIENT_VERSIONS[@]}"; do
   done
 done
 
+for entry in "${PINNED_SCENARIOS[@]}"; do
+  IFS=':' read -r sc ver <<< "$entry"
+  echo "== official client: ${sc} @ ${ver} =="
+  if npx --yes "$CONFORMANCE" client \
+      --command "$BIN" --scenario "$sc" --spec-version "$ver"; then
+    echo "  PASS  ${sc} @ ${ver}"
+  else
+    echo "  FAIL  ${sc} @ ${ver}"
+    failures=$((failures + 1))
+  fi
+done
+
 # --- Stage 3: known gaps ---------------------------------------------------
 
 echo
@@ -100,7 +115,7 @@ fi
 
 # --- Summary ---------------------------------------------------------------
 
-blocking=$(( ${#CLIENT_VERSIONS[@]} * ${#CLIENT_SCENARIOS[@]} + 1 ))
+blocking=$(( ${#CLIENT_VERSIONS[@]} * ${#CLIENT_SCENARIOS[@]} + ${#PINNED_SCENARIOS[@]} + 1 ))
 echo
 if [ "$failures" -eq 0 ]; then
   echo "Conformance: all ${blocking} blocking check(s) passed."

@@ -74,15 +74,18 @@ and it appears in the matrix. Nothing else needs touching.
 ./scripts/run-conformance.sh --gaps   # also re-check known gaps
 ```
 
-Blocking today: `initialize` and `tools_call` for `2025-06-18` and `2025-11-25`.
+Blocking today: `initialize` and `tools_call` for `2025-06-18` and
+`2025-11-25`, plus `elicitation-sep1034-client-defaults` at `2025-11-25`.
 
-Known gaps, reported but never fatal — they need client features that do not
-exist yet, and the script tells you if one starts passing:
+One known gap, reported but never fatal — the script tells you if it starts
+passing:
 
 | Scenario | Needs |
 | --- | --- |
-| `sse-retry` | GET reconnection after a graceful SSE stream close |
-| `elicitation-sep1034-client-defaults` | Handling server-initiated `elicitation/create` |
+| `sse-retry` | Honouring the SSE `retry:` field and sending `Last-Event-ID` on reconnect |
+
+Both are parsed and carried across reconnects already; what remains is that the
+scenario's own stream never reaches the branch that uses them.
 
 Server-side reference scenarios cannot run: the official suite drives a server
 over `--url`, and this crate's server has no HTTP serving mode. The in-repo
