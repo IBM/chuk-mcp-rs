@@ -38,3 +38,10 @@ criterion = "0.5"
 name = "protocol"
 path = "benches/protocol/main.rs"
 harness = false
+
+# The fixtures the reference conformance suite requires are many and varied
+# enough to want a module each, so this binary is a directory rather than a
+# file. The name is what `scripts/run-conformance.sh` invokes.
+[[bin]]
+name = "chuk-mcp-conformance-server"
+path = "src/bin/conformance_server/main.rs"

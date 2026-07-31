@@ -322,11 +322,11 @@ as a black box. **Every client scenario it offers at a version we support
 passes** — `initialize` and `tools_call` at both `2025-06-18` and `2025-11-25`,
 plus `elicitation-sep1034-client-defaults` and `sse-retry` at `2025-11-25`.
 
-Server-side reference scenarios now run too, against the HTTP serving mode —
-**7 of 31** pass — the lifecycle plus tools, resources and prompts listing.
-The rest need features not yet built (subscriptions, server-initiated sampling,
-richer content types) or fixtures shaped to each scenario's expectations.
-Reported by the script, not blocking.
+Server-side reference scenarios run too, against the HTTP serving mode, and
+**all 39 checks across 30 scenarios pass** — the lifecycle, logging,
+completion, subscriptions, URI templates, binary resources, every content type,
+and the server-initiated exchanges (progress, sampling, elicitation). Blocking,
+like the client scenarios.
 
 The upstream draft (`2026-07-28`) client scenarios are auth-only, which is why
 the modern era is covered by the in-repo suite instead.

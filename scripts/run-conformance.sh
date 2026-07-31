@@ -8,11 +8,9 @@
 # Stage 3  known gaps       — reference scenarios we do not pass yet. Opt-in
 #                             (--gaps); reported, never fatal.
 #
-# Stage 4  official server  — the reference server scenarios. Reported, not
-#                             blocking: the lifecycle passes but several
-#                             scenarios need server features (prompts,
-#                             subscriptions, sampling, richer content types)
-#                             that are not built yet.
+# Stage 4  official server  — the reference server scenarios, all of them.
+#                             Blocking: every scenario passes, so anything that
+#                             stops passing is a regression rather than news.
 #
 # The draft (2026-07-28) client scenarios upstream are auth-only, so the modern
 # era is covered by stage 1 rather than by the reference suite.
@@ -127,21 +125,27 @@ fi
 # --- Stage 4: the official server scenarios --------------------------------
 
 echo
-echo "== official server scenarios (reported, non-blocking) =="
+echo "== official server scenarios =="
 cargo build --quiet --manifest-path "$ROOT/Cargo.toml" --bin chuk-mcp-conformance-server
 "$ROOT/target/debug/chuk-mcp-conformance-server" "$SERVER_BIND" >/dev/null 2>&1 &
 server_pid=$!
 sleep 2
 
-npx --yes "$CONFORMANCE" server \
-  --url "http://${SERVER_BIND}/mcp" --spec-version 2025-11-25 2>&1 | tail -3
+if npx --yes "$CONFORMANCE" server \
+     --url "http://${SERVER_BIND}/mcp" --spec-version 2025-11-25 2>&1 | tail -3; then
+  echo "  PASS  official server scenarios"
+else
+  echo "  FAIL  official server scenarios"
+  failures=$((failures + 1))
+fi
 
 kill "$server_pid" 2>/dev/null
 wait "$server_pid" 2>/dev/null
 
 # --- Summary ---------------------------------------------------------------
 
-blocking=$(( ${#CLIENT_VERSIONS[@]} * ${#CLIENT_SCENARIOS[@]} + ${#PINNED_SCENARIOS[@]} + 1 ))
+# The in-repo suite, the client scenarios, and the server suite.
+blocking=$(( ${#CLIENT_VERSIONS[@]} * ${#CLIENT_SCENARIOS[@]} + ${#PINNED_SCENARIOS[@]} + 2 ))
 echo
 if [ "$failures" -eq 0 ]; then
   echo "Conformance: all ${blocking} blocking check(s) passed."

@@ -6,11 +6,13 @@ use std::sync::Arc;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
+use tokio::sync::mpsc;
 
-use crate::protocol::json_rpc::parse_message_str;
+use crate::protocol::json_rpc::{parse_message_str, JsonRpcMessage};
 use crate::server::McpServer;
 
 use super::response::{self, Body};
+use super::sse;
 
 /// The path this server answers on. The specification puts both directions of
 /// Streamable HTTP on one endpoint.
@@ -27,9 +29,18 @@ const MAX_BODY: usize = 10 * 1024 * 1024;
 /// whoever has to debug it.
 pub(crate) async fn handle(
     server: Arc<McpServer>,
+    options: Arc<super::HttpOptions>,
     request: Request<Incoming>,
 ) -> Result<Response<Body>, Infallible> {
     let (parts, body) = request.into_parts();
+
+    // Before the path, before the method, before the body is read: a request
+    // from somewhere this server does not serve is refused whatever it asks
+    // for. See `super::origin` for what the check is defending against.
+    if let Err(reason) = super::origin::check(&parts.headers, &options.allowed_hosts) {
+        tracing::warn!("refused a request: {reason}");
+        return Ok(response::text_error(StatusCode::FORBIDDEN, &reason));
+    }
 
     if parts.uri.path() != MCP_PATH {
         return Ok(response::text_error(
@@ -40,12 +51,16 @@ pub(crate) async fn handle(
 
     Ok(match parts.method {
         Method::POST => {
-            let session = parts
-                .headers
-                .get(response::SESSION_HEADER)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string);
-            post(server, body, session).await
+            let header = |name: &str| {
+                parts
+                    .headers
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string)
+            };
+            let session = header(response::SESSION_HEADER);
+            let accept = header(hyper::header::ACCEPT.as_str());
+            post(server, body, session, accept).await
         }
         // The server-to-client stream. Accepted and held open by a server that
         // has something to push; this one answers everything on the POST that
@@ -60,7 +75,12 @@ pub(crate) async fn handle(
 }
 
 /// Answer a POSTed JSON-RPC message.
-async fn post(server: Arc<McpServer>, body: Incoming, session: Option<String>) -> Response<Body> {
+async fn post(
+    server: Arc<McpServer>,
+    body: Incoming,
+    session: Option<String>,
+    accept: Option<String>,
+) -> Response<Body> {
     // Bounded before reading: a body that never ends would otherwise be read
     // until the process ran out of memory.
     let collected = match http_body_util::Limited::new(body, MAX_BODY).collect().await {
@@ -90,12 +110,46 @@ async fn post(server: Arc<McpServer>, body: Incoming, session: Option<String>) -
         }
     };
 
+    // A call to a tool that talks while it works cannot be answered with one
+    // JSON body: what it says has to reach the client before the result does.
+    if server.needs_stream(&message) && sse::accepts_event_stream(accept.as_deref()) {
+        return stream(server, message, session);
+    }
+
     let (answer, assigned) = server.handle_message(message, session.as_deref()).await;
 
     match answer {
         Some(answer) => response::json(&answer, assigned.as_deref()),
-        // A notification earns no reply, which is the difference between it
-        // and a request.
+        // A notification, or an answer to something this server asked. Neither
+        // earns a reply, which is the difference between them and a request.
         None => response::accepted(),
     }
+}
+
+/// Answer on an event stream, handling the message in the background.
+///
+/// The handler owns the sending half: every notification and request it makes
+/// becomes an event, the result is the last one, and dropping the sender ends
+/// the stream.
+fn stream(
+    server: Arc<McpServer>,
+    message: JsonRpcMessage,
+    session: Option<String>,
+) -> Response<Body> {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let context = server.context_for(&message, sender.clone());
+
+    tokio::spawn(async move {
+        let (answer, _assigned) = server
+            .handle_message_with(message, session.as_deref(), context)
+            .await;
+        if let Some(answer) = answer {
+            let _ = sender.send(answer);
+        }
+        // Dropping the sender here is what closes the stream.
+    });
+
+    // A session is never assigned on a streamed call: only `initialize` does
+    // that, and it is not a tool call.
+    response::event_stream(receiver, None)
 }

@@ -59,11 +59,81 @@ pub fn prompt_argument(
 
 /// A message in a prompt, with the text content shape.
 pub fn text_message(role: impl Into<String>, text: impl Into<String>) -> PromptMessage {
+    message(role, json!({"type": "text", "text": text.into()}))
+}
+
+/// A message carrying an image, as base64 with its media type.
+pub fn image_message(
+    role: impl Into<String>,
+    data: impl Into<String>,
+    mime_type: impl Into<String>,
+) -> PromptMessage {
+    message(
+        role,
+        json!({"type": "image", "data": data.into(), "mimeType": mime_type.into()}),
+    )
+}
+
+/// A message carrying a resource inline, so the model sees the content rather
+/// than a URI it cannot fetch.
+pub fn resource_message(
+    role: impl Into<String>,
+    uri: impl Into<String>,
+    mime_type: impl Into<String>,
+    text: impl Into<String>,
+) -> PromptMessage {
+    message(
+        role,
+        json!({
+            "type": "resource",
+            "resource": {
+                "uri": uri.into(),
+                "mimeType": mime_type.into(),
+                "text": text.into(),
+            },
+        }),
+    )
+}
+
+/// A message with whatever content shape the caller has built.
+pub fn message(role: impl Into<String>, content: Value) -> PromptMessage {
     PromptMessage {
         role: role.into(),
-        content: json!({"type": "text", "text": text.into()}),
+        content,
         extra: Map::new(),
     }
+}
+
+/// Add a prompt to a registry.
+pub(crate) fn register<F, Fut>(
+    prompts: &mut PromptRegistry,
+    name: &str,
+    description: &str,
+    arguments: Vec<PromptArgument>,
+    handler: F,
+) where
+    F: Fn(Map<String, Value>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Vec<PromptMessage>, String>> + Send + 'static,
+{
+    let handler = Arc::new(handler);
+    prompts.insert(
+        name.to_string(),
+        RegisteredPrompt {
+            definition: Prompt {
+                name: name.to_string(),
+                description: Some(description.to_string()),
+                // An empty argument list and no argument list say the same
+                // thing; sending the empty one implies a shape that is not there.
+                arguments: (!arguments.is_empty()).then_some(arguments),
+                extra: Map::new(),
+            },
+            handler: Arc::new(move |args| {
+                let handler = handler.clone();
+                Box::pin(async move { handler(args).await })
+            }),
+        },
+    );
+    tracing::debug!("Registered prompt: {name}");
 }
 
 /// The `prompts/list` result.
@@ -237,5 +307,76 @@ mod tests {
             .await
             .expect_err("must surface the handler's failure");
         assert!(message.contains("corpus is offline"));
+    }
+
+    #[tokio::test]
+    async fn registering_describes_the_prompt_and_renders_it() {
+        let mut prompts = PromptRegistry::new();
+        register(
+            &mut prompts,
+            "greet",
+            "Say hello",
+            vec![prompt_argument("who", "Who to greet", true)],
+            |arguments| async move {
+                let who = arguments
+                    .get("who")
+                    .and_then(Value::as_str)
+                    .unwrap_or("world");
+                Ok(vec![text_message("user", format!("Hello, {who}!"))])
+            },
+        );
+
+        let listed = list_result(&prompts);
+        assert_eq!(listed[FIELD_PROMPTS][0]["name"], json!("greet"));
+        assert_eq!(
+            listed[FIELD_PROMPTS][0]["arguments"][0]["name"],
+            json!("who")
+        );
+
+        let mut arguments = Map::new();
+        arguments.insert("who".to_string(), json!("Ada"));
+        let rendered = get_result(&prompts, "greet", arguments)
+            .await
+            .expect("a prompt that renders");
+        assert_eq!(
+            rendered[FIELD_MESSAGES][0]["content"]["text"],
+            json!("Hello, Ada!")
+        );
+    }
+
+    /// An empty argument list and no argument list say the same thing, so the
+    /// empty one is not sent — it would imply a shape that is not there.
+    #[tokio::test]
+    async fn a_prompt_with_no_arguments_declares_none() {
+        let mut prompts = PromptRegistry::new();
+        register(
+            &mut prompts,
+            "bare",
+            "Nothing to fill in",
+            vec![],
+            |_| async { Ok(vec![text_message("user", "hello")]) },
+        );
+
+        let listed = list_result(&prompts);
+        assert!(listed[FIELD_PROMPTS][0].get("arguments").is_none());
+    }
+
+    #[test]
+    fn a_message_carries_whichever_content_shape_it_was_built_with() {
+        let image = image_message("user", "aGk=", "image/png");
+        assert_eq!(image.role, "user");
+        assert_eq!(image.content["type"], json!("image"));
+        assert_eq!(image.content["data"], json!("aGk="));
+        assert_eq!(image.content["mimeType"], json!("image/png"));
+
+        let embedded = resource_message("user", "t://x", "text/plain", "inside");
+        assert_eq!(embedded.content["type"], json!("resource"));
+        assert_eq!(embedded.content["resource"]["uri"], json!("t://x"));
+        assert_eq!(embedded.content["resource"]["text"], json!("inside"));
+
+        // And anything else the caller assembles itself.
+        let custom = message("assistant", json!({"type": "audio", "data": "aGk="}));
+        assert_eq!(custom.role, "assistant");
+        assert_eq!(custom.content["type"], json!("audio"));
     }
 }

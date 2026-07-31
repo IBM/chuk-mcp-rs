@@ -177,7 +177,12 @@ result.server_identity();   // Some(..) when the server identified itself
 
 ## What is not built yet
 
-The **server** speaks the legacy lifecycle only — there is no `server/discover`
-handler and no stateless request path. The in-repo conformance suite reflects
-that honestly: its matrix has modern client rules and legacy server rules, and
-no modern server rules at all. See [testing.md](testing.md).
+The **server** answers `server/discover` and serves the stateless modern path
+alongside the legacy lifecycle, so the in-repo matrix now carries modern server
+rules as well as legacy ones. See [testing.md](testing.md).
+
+What remains is on the notification side: the server records
+`resources/subscribe` but nothing yet sends `notifications/resources/updated`
+when a resource changes, and the same is true of the `listChanged`
+notifications. A subscription is honoured as far as being remembered, which is
+all the specification's `resources/subscribe` requires of the call itself.

@@ -82,16 +82,21 @@ Blocking today: `initialize` and `tools_call` for `2025-06-18` and
 now passes**, so the known-gaps list is empty; the script still prints the
 section, so a new entry is visible the moment one appears.
 
-Server-side reference scenarios **now run**, against `chuk-mcp-conformance-server`
-over the HTTP serving mode. Reported, not blocking: **7 of 31 pass** today —
-`server-initialize`, `ping`, `tools-list`, `resources-list`, `prompts-list` and
-`server-sse-multiple-streams`. The rest need either server features that do not
-exist (subscriptions, server-initiated sampling, richer content types like
-audio, images and embedded resources) or fixtures shaped to what each scenario
-expects to find registered. The in-repo
-suite covers the server's behaviour meanwhile. The upstream draft
-(`2026-07-28`) client scenarios are auth-only, which is why the modern era is
-covered in-repo rather than upstream.
+Server-side reference scenarios run against `chuk-mcp-conformance-server` over
+the HTTP serving mode, and **all 39 checks across 30 scenarios pass** — so the
+stage blocks, and anything that stops passing is a regression rather than news.
+That covers logging, completion, subscriptions, URI templates, binary
+resources, every content type, and the three server-initiated exchanges
+(progress, sampling and elicitation).
+
+The fixtures each scenario expects live in
+`crates/chuk-mcp/src/bin/conformance_server/`, one module per kind. A scenario
+that fails with `Unknown tool`/`Unknown prompt`/`Unknown resource` is missing
+its fixture, not a protocol feature — worth checking before concluding
+anything deeper is wrong.
+
+The upstream draft (`2026-07-28`) client scenarios are auth-only, which is why
+the modern era is covered in-repo rather than upstream.
 
 ## Micro-benchmarks
 

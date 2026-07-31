@@ -58,11 +58,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      # Two stages, both blocking: our own rule suite (both eras, client and
-      # server) and the official @modelcontextprotocol/conformance client
-      # scenarios for 2025-06-18 and 2025-11-25. Scenarios we do not pass yet
-      # are listed in the script and reported without failing the build; see
-      # its header for why server-side reference scenarios cannot run here.
+      # Three stages, all blocking: our own rule suite (both eras, client and
+      # server), the official @modelcontextprotocol/conformance client
+      # scenarios for 2025-06-18 and 2025-11-25, and the reference server
+      # scenarios. Client scenarios we do not pass yet would be listed in the
+      # script and reported without failing the build; that list is empty.
       - name: Conformance
         run: ./scripts/run-conformance.sh
 

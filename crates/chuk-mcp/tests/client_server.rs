@@ -220,14 +220,17 @@ async fn server_dispatch_full() {
     .unwrap();
     assert_eq!(resp.error().unwrap().code, -32602);
 
-    // tools/call: handler error -> internal error
+    // tools/call: a handler that fails answers with isError, not a JSON-RPC
+    // error — the call was valid, the work was not possible.
     let resp = dispatch(
         &server,
         json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "boom"}}),
     )
     .await
     .unwrap();
-    assert_eq!(resp.error().unwrap().code, -32603);
+    let failed = resp.result().unwrap();
+    assert_eq!(failed["isError"], json!(true));
+    assert!(failed["content"][0]["text"].as_str().is_some());
 
     // resources/list + read (success / unknown / handler error)
     let resp = dispatch(
