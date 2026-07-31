@@ -27,6 +27,7 @@ mod arguments;
 mod http;
 mod input;
 mod server;
+mod server_protocol;
 mod streams;
 mod types;
 use arguments::{ResourceParts, ToolParts};
@@ -664,6 +665,7 @@ fn chuk_mcp_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     http::register(m)?;
     input::register(m)?;
     server::register(m)?;
+    server_protocol::register(m)?;
     m.add_function(wrap_pyfunction!(connect, m)?)?;
     m.add_function(wrap_pyfunction!(connect_to_server, m)?)?;
     m.add_function(wrap_pyfunction!(supported_versions, m)?)?;

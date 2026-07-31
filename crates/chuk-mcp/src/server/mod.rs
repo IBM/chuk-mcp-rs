@@ -444,6 +444,20 @@ impl McpServer {
 
 /// Format a tool handler's result as MCP content blocks, matching the Python
 /// `MCPServer._format_content`.
+/// Whether a handler's value is already a complete result rather than content
+/// to wrap.
+///
+/// A tool that needs more input returns an `input_required` result; wrapping it
+/// in content blocks would turn a question into a paragraph of JSON the client
+/// would read as an answer.
+fn is_input_required(value: &Value) -> bool {
+    value
+        .get("resultType")
+        .and_then(Value::as_str)
+        .map(|kind| kind == crate::protocol::mrtr::RESULT_TYPE_INPUT_REQUIRED)
+        .unwrap_or(false)
+}
+
 fn format_content(result: &Value) -> Vec<Value> {
     match result {
         Value::String(s) => vec![json!({"type": "text", "text": s})],

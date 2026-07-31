@@ -31,7 +31,7 @@ mod state;
 
 pub use elicitation::{ElicitAction, ElicitMode, ElicitRequest, ElicitResult};
 pub use exchange::{InputRequest, InputRequests, InputResponses};
-pub use result::{InputRequired, RESULT_TYPE_INPUT_REQUIRED};
+pub use result::{input_required_result, InputRequired, RESULT_TYPE_INPUT_REQUIRED};
 pub use state::RequestState;
 
 use crate::protocol::messages::method::MessageMethod;

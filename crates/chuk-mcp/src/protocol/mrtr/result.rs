@@ -78,6 +78,43 @@ impl InputRequired {
     }
 }
 
+/// Build an `input_required` result — the server half of [`InputRequired`].
+///
+/// A server that needs more input returns this instead of a completed result,
+/// and the client answers it and retries. Rejects the one shape the
+/// specification forbids: neither field present, which would ask the client to
+/// send an identical request and expect a different answer.
+pub fn input_required_result(
+    input_requests: InputRequests,
+    request_state: Option<RequestState>,
+) -> Result<Value, McpError> {
+    if input_requests.is_empty() && request_state.is_none() {
+        return Err(McpError::validation(format!(
+            "an {RESULT_TYPE_INPUT_REQUIRED} result needs at least one of \
+             {FIELD_INPUT_REQUESTS} or {FIELD_REQUEST_STATE}"
+        )));
+    }
+
+    let mut result = serde_json::Map::new();
+    result.insert(
+        FIELD_RESULT_TYPE.to_string(),
+        Value::String(RESULT_TYPE_INPUT_REQUIRED.to_string()),
+    );
+    if !input_requests.is_empty() {
+        result.insert(
+            FIELD_INPUT_REQUESTS.to_string(),
+            serde_json::to_value(&input_requests)?,
+        );
+    }
+    if let Some(state) = &request_state {
+        result.insert(
+            FIELD_REQUEST_STATE.to_string(),
+            Value::String(state.echo().to_string()),
+        );
+    }
+    Ok(Value::Object(result))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +206,41 @@ mod tests {
         }))
         .expect_err("must be rejected");
         assert!(error.to_string().contains("inputRequests"));
+    }
+
+    #[test]
+    fn what_we_build_is_what_we_parse() {
+        // The two halves of the same contract: a result this server produces
+        // must read back through the client's own parser unchanged.
+        let mut requests = InputRequests::new();
+        requests.insert(
+            "who".to_string(),
+            crate::protocol::mrtr::InputRequest {
+                method: MessageMethod::ELICITATION_CREATE.to_string(),
+                params: json!({"message": "Who are you?"}),
+            },
+        );
+
+        let built = input_required_result(requests, Some(RequestState::new("opaque")))
+            .expect("a valid input_required result");
+        let parsed = InputRequired::from_result(&built)
+            .expect("parses")
+            .expect("is an input_required");
+
+        assert_eq!(parsed.input_requests.len(), 1);
+        assert_eq!(
+            parsed.input_requests["who"].method,
+            MessageMethod::ELICITATION_CREATE
+        );
+        assert!(parsed.request_state.is_some());
+    }
+
+    #[test]
+    fn building_with_neither_field_is_refused() {
+        // The same rule the parser enforces, applied where the mistake is made.
+        assert!(input_required_result(InputRequests::new(), None).is_err());
+        // State alone is enough — the URL-mode case.
+        assert!(input_required_result(InputRequests::new(), Some(RequestState::new("s"))).is_ok());
     }
 
     #[test]
