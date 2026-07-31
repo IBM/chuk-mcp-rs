@@ -2,8 +2,131 @@
 
 A Model Context Protocol (MCP) client and server library in Rust, with Python
 bindings — speaking **both** protocol generations: the stateless `2026-07-28`
-revision and the legacy `initialize`-handshake era, with automatic detection
-between them.
+revision and the legacy `initialize`-handshake era, working out which one a
+server wants so you do not have to.
+
+---
+
+## Quickstart
+
+**Rust**
+
+```bash
+cargo add chuk-mcp tokio serde_json
+```
+
+```rust
+use chuk_mcp::prelude::*;
+
+#[tokio::main]
+async fn main() -> Result<(), McpError> {
+    // A URL or a command line — it picks the transport and the protocol era.
+    let mut client = connect("./my-mcp-server").await?;
+
+    println!("connected to {}", client.server_info().unwrap().name);
+    for tool in client.list_tools().await? {
+        println!("  {}", tool.name);
+    }
+
+    let result = client.call_tool("greet", json!({"name": "World"})).await?;
+    println!("{}", result.text());
+
+    client.close().await
+}
+```
+
+**Python**
+
+```bash
+pip install chuk-mcp-rs
+```
+
+```python
+import asyncio
+from chuk_mcp_rs import connect
+
+async def main():
+    async with await connect("./my-mcp-server") as client:
+        print("connected to", client.server_info.name)
+        for tool in await client.list_tools():
+            print(" ", tool.name)
+
+        result = await client.call_tool("greet", {"name": "World"})
+        print(result.text)
+
+asyncio.run(main())
+```
+
+That is the whole API for most uses. `connect` takes a URL (`https://…/mcp`) or
+a command line (`python server.py`), spawns or dials it, detects whether the
+server speaks `2026-07-28` or the legacy protocol, completes the right
+handshake, and hands back a client that works the same either way.
+
+### Run it right now
+
+No server of your own needed — the repo ships one:
+
+```bash
+git clone https://github.com/IBM/chuk-mcp-rs && cd chuk-mcp-rs
+cargo build --bin chuk-mcp-demo-server
+cargo run --example interop_client -- ./target/debug/chuk-mcp-demo-server
+```
+
+```text
+connected: chuk-mcp-demo v0.1.0 over legacy
+ping: true
+tools: ["add", "greet"]
+greet: Hello, RustClient!
+add: {
+  "sum": 42.0
+}
+```
+
+### Where to go next
+
+| I want to… | Go to |
+| --- | --- |
+| Set a token, a header, or pin the protocol era | [Options](#options) |
+| Build a server | [Your first server](#your-first-server) |
+| Understand the two protocol eras | [docs/protocol-eras.md](docs/protocol-eras.md) |
+| Answer a server that asks the user a question | [docs/python.md](docs/python.md#answering-a-server-that-asks-for-input) |
+| Use Python specifically | [docs/python.md](docs/python.md) |
+| Pick a transport myself | [docs/transports.md](docs/transports.md) |
+
+---
+
+## Options
+
+`Connect` is `connect` with the knobs exposed:
+
+```rust
+let client = Connect::to("https://example.com/mcp")
+    .bearer_token(token)
+    .header("X-Tenant", "acme")
+    .era(EraMode::Legacy)               // pin instead of detecting
+    .timeout(Duration::from_secs(10))
+    .input_handler(handler)             // answer questions from the server
+    .connect()
+    .await?;
+```
+
+```python
+client = await connect(
+    "https://example.com/mcp",
+    bearer_token=token,
+    headers={"X-Tenant": "acme"},
+    era="legacy",                       # "auto" | "legacy" | "2026-07-28"
+    timeout=10.0,
+    on_elicit=handler,
+)
+```
+
+`client.era()` and `client.protocol_version()` (`.era` / `.protocol_version` in
+Python) report what it settled on.
+
+---
+
+## The crates
 
 | Crate | What it is |
 | --- | --- |
@@ -15,102 +138,6 @@ re-exports these bindings, so `import chuk_mcp` keeps working unchanged while
 being powered by Rust — [about 6× more tool calls per
 second](benchmarks/README.md) than the last pure-Python release, with no code
 changes.
-
----
-
-## Install
-
-**Rust**
-
-```bash
-cargo add chuk-mcp tokio serde_json
-```
-
-**Python**
-
-```bash
-pip install chuk-mcp-rs      # the bindings directly
-pip install chuk-mcp         # or the familiar package, Rust-powered
-```
-
----
-
-## Your first client
-
-One call. Give it a URL or a command line; it picks the transport, works out
-which protocol generation the server speaks, and completes that generation's
-handshake:
-
-```rust
-use chuk_mcp::prelude::*;
-
-#[tokio::main]
-async fn main() -> Result<(), McpError> {
-    let mut client = connect("https://example.com/mcp").await?;
-    //  …or: connect("python server.py").await?
-
-    for tool in client.list_tools().await? {
-        println!("{}", tool.name);
-    }
-
-    let result = client.call_tool("greet", json!({"name": "World"})).await?;
-    println!("{}", result.text());
-
-    client.close().await
-}
-```
-
-The same thing in Python:
-
-```python
-import asyncio
-from chuk_mcp_rs import connect
-
-async def main():
-    async with await connect("https://example.com/mcp") as client:
-        # …or: await connect("python server.py")
-        for tool in await client.list_tools():
-            print(tool.name)
-        result = await client.call_tool("greet", {"name": "World"})
-        print(result.text)
-
-asyncio.run(main())
-```
-
-`client.era()` and `client.protocol_version()` (`.era` / `.protocol_version` in
-Python) report what it settled on.
-
-When you need options, the builder is the same thing with the knobs exposed:
-
-```rust
-let client = Connect::to("https://example.com/mcp")
-    .bearer_token(token)
-    .header("X-Tenant", "acme")
-    .era(EraMode::Legacy)          // pin instead of detecting
-    .timeout(Duration::from_secs(10))
-    .connect()
-    .await?;
-```
-
-```python
-client = await connect(
-    "https://example.com/mcp",
-    bearer_token=token,
-    headers={"X-Tenant": "acme"},
-    era="legacy",
-    timeout=10.0,
-)
-```
-
-The typed layer underneath — the transports, the `send_*` helpers — is still
-there for when you want to say exactly what you mean.
-
-Try it against the bundled demo server:
-
-```bash
-cargo build --bin chuk-mcp-demo-server
-cargo run --example interop_client -- ./target/debug/chuk-mcp-demo-server
-```
 
 ---
 
@@ -206,8 +233,8 @@ Everything after connecting is identical in both eras — `list_tools`,
 normalise upward, so `result.result_type` (`result.resultType` in Python) reads
 `"complete"` whichever peer produced it.
 
-Pin the era with `.era(EraMode::Legacy)` or `EraMode::Modern` (`era="legacy"` /
-`"2026-07-28"` in Python) when you already know, and no probe is sent.
+Pin the era with `.era(...)` — see [Options](#options) — when you already know,
+and no probe is sent.
 
 **Deeper:** [docs/protocol-eras.md](docs/protocol-eras.md) — detection rules,
 caching, `_meta` and header mirroring, parameter promotion.

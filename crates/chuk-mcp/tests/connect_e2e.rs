@@ -5,10 +5,12 @@
 //! the conformance suite.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::json;
 
+use chuk_mcp::client::input::DeclineAll;
 use chuk_mcp::protocol::envelope::ClientIdentity;
 use chuk_mcp::protocol::era::{EraMode, ProtocolEra};
 use chuk_mcp::transports::limits::TransportLimits;
@@ -81,6 +83,22 @@ async fn the_builder_carries_stdio_options() {
 
     assert_eq!(client.era(), Some(ProtocolEra::Legacy));
     assert!(client.protocol_version().is_some());
+    client.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn an_input_handler_reaches_the_client_and_is_declared() {
+    let mut client = Connect::to_command(DEMO_SERVER, Vec::<String>::new())
+        .input_handler(Arc::new(DeclineAll))
+        .connect()
+        .await
+        .expect("connect with an input handler");
+
+    // Attached, so a server that asks mid-call has somewhere to be answered.
+    assert!(
+        client.input_handler().is_some(),
+        "the handler did not reach the client"
+    );
     client.close().await.expect("close");
 }
 

@@ -218,6 +218,11 @@ impl Options {
         let mut parameters = DualEraHttpParameters::new(url)?
             .with_mode(self.mode)
             .with_headers(self.headers);
+        // The transport injects `_meta` on every modern request from its own
+        // identity, so an identity set here has to reach it — otherwise the
+        // capabilities a caller declared (elicitation, most of all) are built
+        // into the probe and then overwritten on every request after it.
+        parameters.identity = self.identity.clone();
         if let Some(token) = self.bearer_token {
             parameters = parameters.with_bearer_token(token);
         }

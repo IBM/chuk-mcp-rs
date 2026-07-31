@@ -4,12 +4,14 @@
 //! client sends `Mcp-Method`, so its presence identifies the request's era
 //! without inspecting the body.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use chuk_mcp::client::input::DeclineAll;
 use chuk_mcp::protocol::era::{EraMode, ProtocolEra};
 use chuk_mcp::protocol::versioning;
 use chuk_mcp::{connect, Connect};
@@ -18,6 +20,9 @@ use chuk_mcp::{connect, Connect};
 const MODERN_MARKER: &str = "mcp-method:";
 /// The header carrying the method, lower-cased for matching.
 const METHOD_HEADER_PREFIX: &str = "mcp-method: ";
+
+/// Raw request bodies the mock received, for asserting on what was declared.
+static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 const SERVER_NAME: &str = "connect-mock";
 const SERVER_VERSION: &str = "1.0.0";
@@ -81,6 +86,9 @@ async fn handle(mut socket: TcpStream, era: Era) {
         .unwrap_or_default()
         .to_string();
     let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    SEEN.lock()
+        .expect("seen lock")
+        .push(String::from_utf8_lossy(&body).to_string());
     let id = parsed.get("id").cloned();
     let body_method = parsed
         .get("method")
@@ -204,6 +212,32 @@ async fn the_builder_pins_an_http_era_and_carries_options() {
 
     // Pinned: no probe was sent, and the era is what we asked for.
     assert_eq!(client.era(), Some(ProtocolEra::Legacy));
+}
+
+#[tokio::test]
+async fn an_http_connection_carries_its_input_handler_and_capability() {
+    let url = spawn(Era::Modern).await;
+    let client = Connect::to_url(&url)
+        .input_handler(Arc::new(DeclineAll))
+        .connect()
+        .await
+        .expect("connect with an input handler");
+
+    assert!(
+        client.input_handler().is_some(),
+        "the handler did not reach the client"
+    );
+
+    // Declaring the capability is half of setting the handler: a server MUST
+    // NOT ask a client that has not said it can answer.
+    //
+    // Searched rather than indexed: the tests in this file share one mock and
+    // run concurrently, so position carries no meaning.
+    let bodies = SEEN.lock().expect("seen lock").clone();
+    assert!(
+        bodies.iter().any(|body| body.contains("elicitation")),
+        "no request declared the elicitation capability: {bodies:#?}"
+    );
 }
 
 #[tokio::test]
