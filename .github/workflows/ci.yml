@@ -42,8 +42,14 @@ jobs:
         env:
           PYO3_PYTHON: python3
 
+      # Benchmarks are not run in CI — the numbers would be noise on a shared
+      # runner — but they are compiled, so a change to the core crate cannot
+      # silently break them.
+      - name: Build benchmarks
+        run: cargo bench -p chuk-mcp --no-run
+
   conformance:
-    name: Conformance (official MCP suite — client)
+    name: Conformance (in-repo rules + official MCP suite)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -52,12 +58,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      # Runs the official @modelcontextprotocol/conformance client scenarios
-      # (initialize, tools_call) against our client runner, for 2025-06-18 and
-      # 2025-11-25. Draft (2026-07-28) client scenarios are auth-only (Phase 5)
-      # and modern server conformance needs the modern chuk server — both
-      # tracked in the roadmap.
-      - name: Client conformance
+      # Two stages, both blocking: our own rule suite (both eras, client and
+      # server) and the official @modelcontextprotocol/conformance client
+      # scenarios for 2025-06-18 and 2025-11-25. Scenarios we do not pass yet
+      # are listed in the script and reported without failing the build; see
+      # its header for why server-side reference scenarios cannot run here.
+      - name: Conformance
         run: ./scripts/run-conformance.sh
 
   coverage:
