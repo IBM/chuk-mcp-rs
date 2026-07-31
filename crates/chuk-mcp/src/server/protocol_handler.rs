@@ -49,6 +49,16 @@ impl ProtocolHandler {
     }
 
     /// Register a custom method handler (overrides built-ins on collision).
+    /// Who this server says it is.
+    pub fn server_info(&self) -> &ServerInfo {
+        &self.server_info
+    }
+
+    /// What this server says it can do.
+    pub fn capabilities(&self) -> &ServerCapabilities {
+        &self.capabilities
+    }
+
     pub fn register_method(&mut self, method: &str, handler: MethodHandler) {
         self.handlers.insert(method.to_string(), handler);
     }

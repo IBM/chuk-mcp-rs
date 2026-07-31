@@ -46,13 +46,14 @@ Coverage:
   legacy      client    6 rules
   legacy      server    10 rules
   2026-07-28  client    10 rules
+  2026-07-28  server    5 rules
   2026-07-28  protocol  3 rules
   both        protocol  8 rules
 ```
 
-There are deliberately **no modern server rules**: this crate's server speaks
-the legacy lifecycle only. An unimplemented era belongs in the matrix as an
-absence, not hidden behind rules that were never written.
+Every era-and-subject pair the implementation covers has rules. An area with
+none shows as an absent row, which is where an unimplemented one belongs —
+not hidden behind rules that were never written.
 
 Rules assert against two fixtures, in `tests/conformance/harness/`:
 
@@ -81,8 +82,10 @@ Blocking today: `initialize` and `tools_call` for `2025-06-18` and
 now passes**, so the known-gaps list is empty; the script still prints the
 section, so a new entry is visible the moment one appears.
 
-Server-side reference scenarios cannot run: the official suite drives a server
-over `--url`, and this crate's server has no HTTP serving mode. The in-repo
+Server-side reference scenarios cannot run yet: the official suite drives a
+server over `--url`, and this crate's server is stdio-served. The protocol half
+is done — the in-repo suite covers it — so what remains is the HTTP serving
+mode. The in-repo
 suite covers the server's behaviour meanwhile. The upstream draft
 (`2026-07-28`) client scenarios are auth-only, which is why the modern era is
 covered in-repo rather than upstream.

@@ -73,7 +73,7 @@ cargo run --example interop_client -- ./target/debug/chuk-mcp-demo-server
 ```
 
 ```text
-connected: chuk-mcp-demo v0.1.0 over legacy
+connected: chuk-mcp-demo v0.1.0 over 2026-07-28
 ping: true
 tools: ["add", "greet"]
 greet: Hello, RustClient!
@@ -190,8 +190,9 @@ server.register_tool(
 asyncio.run(server.run_stdio())
 ```
 
-The server speaks the legacy lifecycle. A `2026-07-28` server is not built yet —
-see [Status](#status).
+The server speaks **both** eras from the one registration: a legacy client gets
+the `initialize` lifecycle, a `2026-07-28` client gets `server/discover` and
+stateless requests, and the era is decided per request rather than per server.
 
 ---
 
@@ -301,19 +302,20 @@ Method and caveats: [benchmarks/README.md](benchmarks/README.md).
 Two suites, both blocking in CI — `./scripts/run-conformance.sh`:
 
 **Our own rule suite**, spec requirements expressed as data and run against this
-client and this server in both eras. 37 of 37 rules hold:
+client and this server in both eras. 42 of 42 rules hold:
 
 | Era | Subject | Rules | Covers |
 | --- | --- | --- | --- |
 | legacy | client | 6 | `initialize` first, required params, `notifications/initialized`, unique ids, `tools/call` shape, version pushed to the transport |
 | `2026-07-28` | client | 10 | `_meta` version + capabilities, the three mirrored headers, parameter promotion, header encoding, no session header, `server/discover`, opaque `requestState` |
 | legacy | server | 10 | `initialize` result, version negotiation, id echo, `tools/list` shape, tool errors, `-32601`, `ping`, notifications unanswered, `resources/read` |
+| `2026-07-28` | server | 5 | `server/discover` shape and statelessness, `resultType` on every result, legacy requests left alone, unsupported versions rejected with the list |
 | `2026-07-28` | protocol | 3 | `input_required` decoding, the methods that may carry it, at-least-one-field |
 | both | protocol | 8 | `resultType` defaulting and preservation, `isError`, batch parsing, era classification, negotiation failure, elicitation modes and actions |
 
-There are deliberately **no modern-server rules**: this crate's server is legacy
-only, and an unimplemented era belongs in the matrix as an absence rather than
-hidden behind rules nobody wrote.
+Every era-and-subject pair the implementation covers has rules. An area with
+none would show as an absent row, which is where an unimplemented one belongs —
+not hidden behind rules nobody wrote.
 
 **The official `@modelcontextprotocol/conformance` suite**, driving our client
 as a black box. **Every client scenario it offers at a version we support
@@ -348,14 +350,15 @@ Full-parity port of the Python package's public surface.
 - **Transports** — stdio, Streamable HTTP in both shapes, the dual-era transports, and the deprecated HTTP+SSE transport.
 - **`2026-07-28`** — per-request `_meta`, mirrored `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` headers, `x-mcp-header` parameter promotion, `server/discover`, era detection and caching, new-request-ID retry on a broken response stream, and the typed result envelope.
 - **Client** — `McpClient`, on any transport, in either era.
-- **Server** — `McpServer` with tool/resource registration, a protocol handler, and in-memory sessions. **Legacy era only**; a modern server is outstanding.
+- **Server** — `McpServer` with tool/resource registration, a protocol handler, and in-memory sessions. Answers **both** eras: `server/discover`, per-request version checking and `resultType` stamping for modern callers, the `initialize` lifecycle for legacy ones.
 
 Wire compatibility is verified in both directions against the Python
 `chuk_mcp` implementation, and against the official
 `@modelcontextprotocol/conformance` client scenarios in CI.
 
-Known gaps, all tracked: a modern-era server, and an HTTP serving mode for it.
-`scripts/run-conformance.sh` prints the current state.
+Known gap: no HTTP **serving** mode, which is what the official suite's
+server-side scenarios need (they drive a server over `--url`). The server is
+stdio-served today. `scripts/run-conformance.sh` prints the current state.
 
 ---
 

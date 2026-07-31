@@ -55,8 +55,8 @@ async fn connect_reports_the_server_it_settled_with() {
 
 #[tokio::test]
 async fn the_builder_can_pin_the_era() {
-    // The demo server is legacy, so pinning legacy must skip the probe and
-    // still succeed.
+    // The demo server speaks both, so pinning legacy must skip the probe and
+    // drive the older lifecycle even though the newer one is available.
     let mut client = Connect::to_command(DEMO_SERVER, Vec::<String>::new())
         .era(EraMode::Legacy)
         .connect()
@@ -81,8 +81,13 @@ async fn the_builder_carries_stdio_options() {
         .await
         .expect("connect with options");
 
-    assert_eq!(client.era(), Some(ProtocolEra::Legacy));
-    assert!(client.protocol_version().is_some());
+    // The demo server answers `server/discover`, so auto-detection settles on
+    // the modern era — the probe against a real server of ours, end to end.
+    assert_eq!(client.era(), Some(ProtocolEra::Modern));
+    assert_eq!(
+        client.protocol_version(),
+        Some(chuk_mcp::protocol::versioning::FIRST_MODERN_VERSION)
+    );
     client.close().await.expect("close");
 }
 

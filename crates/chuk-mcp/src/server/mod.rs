@@ -1,5 +1,7 @@
 //! High-level MCP server, mirroring `chuk_mcp.server`.
 
+pub mod discover;
+pub mod modern;
 pub mod protocol_handler;
 pub mod session;
 
@@ -10,7 +12,8 @@ use std::sync::Arc;
 use futures::Future;
 use serde_json::{json, Value};
 
-use crate::protocol::json_rpc::JsonRpcMessage;
+use crate::protocol::json_rpc::{create_error_response, JsonRpcMessage};
+use crate::protocol::messages::method::MessageMethod;
 use crate::protocol::types::capabilities::ServerCapabilities;
 use crate::protocol::types::errors::{INTERNAL_ERROR, INVALID_PARAMS};
 use crate::protocol::types::info::ServerInfo;
@@ -47,6 +50,9 @@ pub struct McpServer {
     tools: BTreeMap<String, RegisteredTool>,
     resources: BTreeMap<String, RegisteredResource>,
     max_buffer_size: usize,
+    /// Optional natural-language guidance for a model on using this server,
+    /// returned by `server/discover`.
+    instructions: Option<String>,
 }
 
 impl McpServer {
@@ -59,7 +65,15 @@ impl McpServer {
             tools: BTreeMap::new(),
             resources: BTreeMap::new(),
             max_buffer_size: crate::transports::limits::DEFAULT_MAX_BUFFER_SIZE,
+            instructions: None,
         }
+    }
+
+    /// Natural-language guidance for a model on how to use this server,
+    /// returned by `server/discover`.
+    pub fn with_instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.instructions = Some(instructions.into());
+        self
     }
 
     /// Set the maximum bytes buffered for a single inbound message (0 disables).
@@ -144,7 +158,32 @@ impl McpServer {
                     .await;
             }
         }
+        // A modern request declares its version on every call, and a server
+        // that cannot speak it owes the client the list it can — a bare
+        // rejection leaves nothing to renegotiate from.
+        let modern = modern::is_modern_request(&message);
+        if let Some((code, text, data)) = modern::reject_unsupported_version(&message) {
+            if let Some(id) = message.id().cloned() {
+                return (
+                    Some(JsonRpcMessage::Error(create_error_response(
+                        id, code, &text, data,
+                    ))),
+                    None,
+                );
+            }
+        }
+
+        let (mut response, session) = self.dispatch(message, session_id).await;
+        if let Some(response) = response.as_mut() {
+            modern::finish_response(response, modern);
+        }
+        (response, session)
+    }
+
+    /// Route one message to whatever answers it.
+    async fn dispatch(&self, message: JsonRpcMessage, session_id: Option<&str>) -> HandlerResult {
         match message.method() {
+            Some(MessageMethod::SERVER_DISCOVER) => (self.handle_discover(&message), None),
             Some("tools/list") => (self.handle_tools_list(&message), None),
             Some("tools/call") => (self.handle_tools_call(&message).await, None),
             Some("resources/list") => (self.handle_resources_list(&message), None),
@@ -155,6 +194,21 @@ impl McpServer {
                     .await
             }
         }
+    }
+
+    /// Answer `server/discover`, which replaces `initialize` in the modern era
+    /// and establishes nothing: it may be asked at any time, by anyone.
+    fn handle_discover(&self, message: &JsonRpcMessage) -> Option<JsonRpcMessage> {
+        let id = message.id()?.clone();
+        let handler = &self.protocol_handler;
+        Some(self.protocol_handler.create_response(
+            id,
+            Some(discover::discover_result(
+                handler.server_info(),
+                handler.capabilities(),
+                self.instructions.as_deref(),
+            )),
+        ))
     }
 
     fn handle_tools_list(&self, message: &JsonRpcMessage) -> Option<JsonRpcMessage> {
