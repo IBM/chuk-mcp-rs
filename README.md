@@ -276,14 +276,15 @@ Method and caveats: [benchmarks/README.md](benchmarks/README.md).
 Two suites, both blocking in CI — `./scripts/run-conformance.sh`:
 
 **Our own rule suite**, spec requirements expressed as data and run against this
-client and this server in both eras. 31 of 31 rules hold:
+client and this server in both eras. 37 of 37 rules hold:
 
 | Era | Subject | Rules | Covers |
 | --- | --- | --- | --- |
 | legacy | client | 6 | `initialize` first, required params, `notifications/initialized`, unique ids, `tools/call` shape, version pushed to the transport |
-| `2026-07-28` | client | 9 | `_meta` version + capabilities, the three mirrored headers, parameter promotion, header encoding, no session header, `server/discover` |
+| `2026-07-28` | client | 10 | `_meta` version + capabilities, the three mirrored headers, parameter promotion, header encoding, no session header, `server/discover`, opaque `requestState` |
 | legacy | server | 10 | `initialize` result, version negotiation, id echo, `tools/list` shape, tool errors, `-32601`, `ping`, notifications unanswered, `resources/read` |
-| both | protocol | 6 | `resultType` defaulting and preservation, `isError`, batch parsing, era classification, negotiation failure |
+| `2026-07-28` | protocol | 3 | `input_required` decoding, the methods that may carry it, at-least-one-field |
+| both | protocol | 8 | `resultType` defaulting and preservation, `isError`, batch parsing, era classification, negotiation failure, elicitation modes and actions |
 
 There are deliberately **no modern-server rules**: this crate's server is legacy
 only, and an unimplemented era belongs in the matrix as an absence rather than
@@ -291,11 +292,10 @@ hidden behind rules nobody wrote.
 
 **The official `@modelcontextprotocol/conformance` suite**, driving our client
 as a black box — `initialize` and `tools_call` pass for both `2025-06-18` and
-`2025-11-25`.
+`2025-11-25`, and `elicitation-sep1034-client-defaults` passes at `2025-11-25`.
 
-Two scenarios are reported as known gaps rather than passed over: `sse-retry`
-needs GET reconnection after a graceful stream close, and
-`elicitation-sep1034-client-defaults` needs client-side `elicitation/create`.
+One scenario is reported as a known gap rather than passed over: `sse-retry`
+needs the SSE `retry:` field honoured and `Last-Event-ID` sent on reconnect.
 Server-side reference scenarios cannot run at all — the suite drives servers
 over `--url` and this crate has no HTTP serving mode yet.
 

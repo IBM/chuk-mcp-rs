@@ -45,8 +45,9 @@ both.protocol.result-type-default            both        protocol  pass
 Coverage:
   legacy      client    6 rules
   legacy      server    10 rules
-  2026-07-28  client    9 rules
-  both        protocol  6 rules
+  2026-07-28  client    10 rules
+  2026-07-28  protocol  3 rules
+  both        protocol  8 rules
 ```
 
 There are deliberately **no modern server rules**: this crate's server speaks
