@@ -8,5 +8,6 @@ pub mod header_params;
 pub mod json_rpc;
 pub mod messages;
 pub mod meta;
+pub mod mrtr;
 pub mod types;
 pub mod versioning;

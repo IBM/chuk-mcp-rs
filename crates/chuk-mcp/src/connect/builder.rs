@@ -4,9 +4,13 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use std::sync::Arc;
+
+use crate::client::input::InputHandler;
 use crate::client::McpClient;
 use crate::protocol::envelope::ClientIdentity;
 use crate::protocol::era::EraMode;
+use crate::protocol::types::capabilities::ElicitationCapability;
 use crate::protocol::types::errors::McpError;
 use crate::transports::http_dual::{DualEraHttpParameters, DualEraHttpTransport};
 use crate::transports::limits::TransportLimits;
@@ -30,6 +34,7 @@ struct Options {
     headers: HashMap<String, String>,
     env: Option<HashMap<String, String>>,
     credential_context: Option<String>,
+    input_handler: Option<Arc<dyn InputHandler>>,
 }
 
 impl Default for Options {
@@ -43,6 +48,7 @@ impl Default for Options {
             headers: HashMap::new(),
             env: None,
             credential_context: None,
+            input_handler: None,
         }
     }
 }
@@ -149,6 +155,22 @@ impl Connect {
         self
     }
 
+    /// Answer servers that ask for user input.
+    ///
+    /// Also declares the matching `elicitation` capability, in the modern
+    /// `_meta` and the legacy handshake alike — a server **MUST NOT** ask for
+    /// input a client has not declared it can supply, so setting the handler
+    /// and declaring the capability are one action rather than two things to
+    /// remember to keep in step.
+    pub fn input_handler(mut self, handler: Arc<dyn InputHandler>) -> Connect {
+        self.options.identity.capabilities.elicitation = Some(ElicitationCapability::modes(
+            true,
+            handler.supports_url_mode(),
+        ));
+        self.options.input_handler = Some(handler);
+        self
+    }
+
     /// Open the connection, settle the era, and return a ready client.
     pub async fn connect(self) -> Result<McpClient, McpError> {
         let Connect { target, options } = self;
@@ -180,12 +202,16 @@ impl Options {
         )
         .await?;
 
-        Ok(McpClient::from_profile(
+        let mut client = McpClient::from_profile(
             connection.transport,
             connection.read,
             connection.write,
             connection.profile,
-        ))
+        );
+        if let Some(handler) = self.input_handler {
+            client.set_input_handler(handler);
+        }
+        Ok(client)
     }
 
     async fn connect_http(self, url: String) -> Result<McpClient, McpError> {
@@ -207,6 +233,10 @@ impl Options {
         // call to discover the era by accident.
         let profile = settle(&read, &write, self.mode, &self.identity, self.timeout).await?;
 
-        Ok(McpClient::from_profile(transport, read, write, profile))
+        let mut client = McpClient::from_profile(transport, read, write, profile);
+        if let Some(handler) = self.input_handler {
+            client.set_input_handler(handler);
+        }
+        Ok(client)
     }
 }

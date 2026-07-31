@@ -9,6 +9,7 @@ pub mod cross_era;
 pub mod legacy_client;
 pub mod legacy_server;
 pub mod modern_client;
+pub mod mrtr;
 
 use crate::rule::Rule;
 
@@ -18,6 +19,7 @@ pub fn all() -> Vec<Rule> {
     rules.extend(legacy_client::rules());
     rules.extend(modern_client::rules());
     rules.extend(legacy_server::rules());
+    rules.extend(mrtr::rules());
     rules.extend(cross_era::rules());
     rules
 }

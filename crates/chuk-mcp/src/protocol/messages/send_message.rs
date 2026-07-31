@@ -8,10 +8,13 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::sync::{mpsc, Mutex, Notify};
 
-use crate::protocol::json_rpc::{create_request, JsonRpcMessage, ProgressToken, RequestId};
+use crate::protocol::json_rpc::{
+    create_error_response, create_request, create_response, JsonRpcMessage, ProgressToken,
+    RequestId,
+};
 use crate::protocol::messages::method::MessageMethod;
 use crate::protocol::messages::notifications::send_cancelled_notification;
-use crate::protocol::types::errors::{get_error_message, McpError};
+use crate::protocol::types::errors::{get_error_message, McpError, METHOD_NOT_FOUND};
 
 /// Stream of incoming messages from a transport.
 ///
@@ -68,6 +71,23 @@ impl CancellationToken {
 /// Callback invoked with `(progress, total, message)` on progress notifications.
 pub type ProgressCallback = Arc<dyn Fn(f64, Option<f64>, Option<String>) + Send + Sync>;
 
+/// Answers requests a *server* sends the client while it is waiting for a
+/// response of its own.
+///
+/// Only the legacy era does this — the `2026-07-28` revision removed
+/// server-initiated requests in favour of
+/// [MRTR](crate::protocol::mrtr) — but a legacy server can push
+/// `elicitation/create`, `sampling/createMessage` or `roots/list` mid-call, and
+/// without somewhere to route it the request would be silently dropped and the
+/// server would wait forever.
+#[async_trait::async_trait]
+pub trait InboundRequestHandler: Send + Sync {
+    /// Answer one server-initiated request. `None` means "not supported",
+    /// which is reported to the server as a JSON-RPC error rather than left
+    /// unanswered.
+    async fn handle(&self, method: &str, params: Value) -> Option<Value>;
+}
+
 /// Options for [`send_message_with_options`].
 #[derive(Clone, Default)]
 pub struct SendMessageOptions {
@@ -79,6 +99,8 @@ pub struct SendMessageOptions {
     pub cancellation_token: Option<CancellationToken>,
     /// Callback for `notifications/progress` updates tied to this request.
     pub progress_callback: Option<ProgressCallback>,
+    /// Answers server-initiated requests arriving while this one is in flight.
+    pub inbound_handler: Option<Arc<dyn InboundRequestHandler>>,
 }
 
 /// Default request timeout (matches the Python `timeout: float = 60.0`).
@@ -145,6 +167,7 @@ pub async fn send_message_with_options(
             options.cancellation_token.as_ref(),
             progress_token.as_ref(),
             options.progress_callback.as_ref(),
+            options.inbound_handler.as_deref(),
             write_stream,
         ),
     )
@@ -173,6 +196,7 @@ async fn await_response(
     cancellation_token: Option<&CancellationToken>,
     progress_token: Option<&ProgressToken>,
     progress_callback: Option<&ProgressCallback>,
+    inbound_handler: Option<&dyn InboundRequestHandler>,
     write_stream: &WriteStream,
 ) -> Result<Value, McpError> {
     let mut receiver = read_stream.lock().await;
@@ -221,6 +245,16 @@ async fn await_response(
             }
         }
 
+        // A *request* arriving on this stream came from the server: we never
+        // receive our own. Answering it here rather than skipping it is what
+        // keeps a legacy server that pushes `elicitation/create` mid-call from
+        // waiting forever on a reply that the id filter below would have
+        // silently dropped.
+        if msg.is_request() {
+            answer_inbound(&msg, inbound_handler, write_stream).await;
+            continue;
+        }
+
         // Filter by matching id.
         if msg.id() != Some(req_id) {
             tracing::debug!("[send_message] skip unmatched id={:?}", msg.id());
@@ -228,6 +262,44 @@ async fn await_response(
         }
 
         return process_response(msg);
+    }
+}
+
+/// Answer a server-initiated request, or tell the server we cannot.
+///
+/// Never fails the caller's own request: a server asking for something this
+/// client does not do is the server's problem to handle, and the call in
+/// flight is unrelated.
+async fn answer_inbound(
+    msg: &JsonRpcMessage,
+    handler: Option<&dyn InboundRequestHandler>,
+    write_stream: &WriteStream,
+) {
+    let (Some(method), Some(id)) = (msg.method(), msg.id().cloned()) else {
+        return;
+    };
+    let params = msg.params().cloned().unwrap_or(Value::Null);
+
+    let answered = match handler {
+        Some(handler) => handler.handle(method, params).await,
+        None => None,
+    };
+
+    let reply = match answered {
+        Some(result) => JsonRpcMessage::Response(create_response(id, Some(result))),
+        None => {
+            tracing::warn!("[send_message] no handler for server request `{method}`");
+            JsonRpcMessage::Error(create_error_response(
+                id,
+                METHOD_NOT_FOUND,
+                &format!("client does not handle `{method}`"),
+                None,
+            ))
+        }
+    };
+
+    if write_stream.send(reply).await.is_err() {
+        tracing::warn!("[send_message] could not answer server request `{method}`");
     }
 }
 

@@ -1,23 +1,26 @@
 //! High-level MCP client, mirroring `chuk_mcp.client`.
 
-use serde_json::Value;
+pub mod input;
+
+use std::sync::Arc;
+
+use serde_json::{json, Value};
 
 use crate::protocol::era::{ProtocolEra, ServerProfile};
 use crate::protocol::messages::initialize::{send_initialize, InitializeResult};
+use crate::protocol::messages::method::MessageMethod;
 use crate::protocol::messages::ping::send_ping;
-use crate::protocol::messages::prompts::{
-    send_prompts_get, send_prompts_list, GetPromptResult, Prompt,
-};
-use crate::protocol::messages::resources::{
-    send_resources_list, send_resources_read, ReadResourceResult, Resource,
-};
-use crate::protocol::messages::send_message::{ReadStream, WriteStream};
-use crate::protocol::messages::tools::{send_tools_call, send_tools_list, Tool, ToolResult};
+use crate::protocol::messages::prompts::{send_prompts_list, GetPromptResult, Prompt};
+use crate::protocol::messages::resources::{send_resources_list, ReadResourceResult, Resource};
+use crate::protocol::messages::send_message::{ReadStream, SendMessageOptions, WriteStream};
+use crate::protocol::messages::tools::{send_tools_list, Tool, ToolResult};
 use crate::protocol::types::capabilities::ServerCapabilities;
 use crate::protocol::types::errors::McpError;
 use crate::protocol::types::info::ServerInfo;
 use crate::transports::stdio::{StdioParameters, StdioTransport};
 use crate::transports::Transport;
+
+use input::{call_with_input, InputHandler, PushedRequestBridge};
 
 /// High-level MCP client over any [`Transport`].
 ///
@@ -32,6 +35,7 @@ pub struct McpClient {
     capabilities: Option<ServerCapabilities>,
     era: Option<ProtocolEra>,
     protocol_version: Option<String>,
+    input_handler: Option<Arc<dyn InputHandler>>,
 }
 
 impl McpClient {
@@ -45,6 +49,7 @@ impl McpClient {
             capabilities: None,
             era: None,
             protocol_version: None,
+            input_handler: None,
         }
     }
 
@@ -74,6 +79,7 @@ impl McpClient {
             capabilities,
             era: None,
             protocol_version: None,
+            input_handler: None,
         }
     }
 
@@ -96,6 +102,7 @@ impl McpClient {
             capabilities: Some(profile.capabilities),
             era: Some(profile.era),
             protocol_version: Some(profile.protocol_version),
+            input_handler: None,
         }
     }
 
@@ -159,9 +166,22 @@ impl McpClient {
     }
 
     /// Call a tool with JSON object arguments.
+    ///
+    /// If the server answers that it needs more input, the
+    /// [`input_handler`](McpClient::set_input_handler) answers and the call is
+    /// retried until it completes — so this returns a finished result or an
+    /// error, never a half-finished one.
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<ToolResult, McpError> {
-        let (read, write) = self.streams()?;
-        send_tools_call(read, write, name, arguments).await
+        if !arguments.is_object() {
+            return Err(McpError::validation("Tool arguments must be an object"));
+        }
+        let result = self
+            .call_with_rounds(
+                MessageMethod::TOOLS_CALL,
+                json!({"name": name, "arguments": arguments}),
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
     }
 
     /// List available resources.
@@ -170,10 +190,13 @@ impl McpClient {
         Ok(send_resources_list(read, write, None).await?.resources)
     }
 
-    /// Read a resource by URI.
+    /// Read a resource by URI. Drives input rounds, like
+    /// [`call_tool`](McpClient::call_tool).
     pub async fn read_resource(&self, uri: &str) -> Result<ReadResourceResult, McpError> {
-        let (read, write) = self.streams()?;
-        send_resources_read(read, write, uri).await
+        let result = self
+            .call_with_rounds(MessageMethod::RESOURCES_READ, json!({"uri": uri}))
+            .await?;
+        Ok(serde_json::from_value(result)?)
     }
 
     /// List available prompts.
@@ -182,14 +205,68 @@ impl McpClient {
         Ok(send_prompts_list(read, write, None).await?.prompts)
     }
 
-    /// Get a prompt by name with optional arguments.
+    /// Get a prompt by name with optional arguments. Drives input rounds, like
+    /// [`call_tool`](McpClient::call_tool).
     pub async fn get_prompt(
         &self,
         name: &str,
         arguments: Option<Value>,
     ) -> Result<GetPromptResult, McpError> {
+        let mut params = json!({"name": name});
+        if let Some(arguments) = arguments {
+            params["arguments"] = arguments;
+        }
+        let result = self
+            .call_with_rounds(MessageMethod::PROMPTS_GET, params)
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// Send one of the three methods a server may answer with `input_required`,
+    /// driving any rounds it provokes.
+    ///
+    /// Routed through the driver whether or not a handler is set: without one,
+    /// an `input_required` result would otherwise fail to decode into the
+    /// caller's expected type, and "missing field `content`" is a poor way to
+    /// learn that the server wanted to ask the user something.
+    async fn call_with_rounds(&self, method: &str, params: Value) -> Result<Value, McpError> {
         let (read, write) = self.streams()?;
-        send_prompts_get(read, write, name, arguments).await
+        call_with_input(
+            read,
+            write,
+            method,
+            params,
+            self.input_handler.as_deref(),
+            self.send_options(),
+        )
+        .await
+    }
+
+    /// Send options carrying the legacy bridge, so a server that pushes a
+    /// request mid-call is answered by the same handler that answers an
+    /// embedded one.
+    fn send_options(&self) -> SendMessageOptions {
+        SendMessageOptions {
+            inbound_handler: self
+                .input_handler
+                .clone()
+                .map(|handler| Arc::new(PushedRequestBridge::new(handler)) as Arc<_>),
+            ..SendMessageOptions::default()
+        }
+    }
+
+    /// Answer server requests for input with `handler`.
+    ///
+    /// Needed for both eras: a modern server returns `input_required` results
+    /// and a legacy one pushes `elicitation/create` requests. Without a
+    /// handler, either is reported as an error rather than guessed at.
+    pub fn set_input_handler(&mut self, handler: Arc<dyn InputHandler>) {
+        self.input_handler = Some(handler);
+    }
+
+    /// The input handler, if one is set.
+    pub fn input_handler(&self) -> Option<&Arc<dyn InputHandler>> {
+        self.input_handler.as_ref()
     }
 
     /// Ping the server. Returns `false` on failure rather than erroring.

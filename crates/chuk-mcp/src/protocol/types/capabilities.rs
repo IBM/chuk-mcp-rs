@@ -75,6 +75,28 @@ pub struct ElicitationCapability {
     pub extra: Map<String, Value>,
 }
 
+impl ElicitationCapability {
+    /// Declare which elicitation modes the client can actually service.
+    ///
+    /// A server **MUST NOT** send a mode the client has not declared, so this
+    /// has to reflect what the handler can really do: claiming URL mode without
+    /// somewhere to open a URL earns requests that can only be declined.
+    ///
+    /// An empty object means form mode only, for compatibility with servers
+    /// written before URL mode existed — so declaring neither still declares
+    /// form.
+    pub fn modes(form: bool, url: bool) -> Self {
+        let mut extra = Map::new();
+        if form {
+            extra.insert("form".to_string(), Value::Object(Map::new()));
+        }
+        if url {
+            extra.insert("url".to_string(), Value::Object(Map::new()));
+        }
+        ElicitationCapability { extra }
+    }
+}
+
 /// Capabilities that a server may support.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ServerCapabilities {
@@ -155,5 +177,39 @@ mod tests {
         let caps: ServerCapabilities = serde_json::from_value(raw.clone()).unwrap();
         assert_eq!(caps.tools.as_ref().unwrap().list_changed, Some(true));
         assert_eq!(serde_json::to_value(&caps).unwrap(), raw);
+    }
+
+    #[test]
+    fn elicitation_modes_serialize_as_the_specification_declares_them() {
+        // "{ "elicitation": { "form": {}, "url": {} } }"
+        assert_eq!(
+            serde_json::to_value(ElicitationCapability::modes(true, true)).unwrap(),
+            serde_json::json!({"form": {}, "url": {}})
+        );
+
+        // Form only: a handler with nowhere to open a URL must not claim URL
+        // mode, or it will be sent requests it can only decline.
+        assert_eq!(
+            serde_json::to_value(ElicitationCapability::modes(true, false)).unwrap(),
+            serde_json::json!({"form": {}})
+        );
+
+        // "an empty capabilities object is equivalent to declaring support for
+        // form mode only", so declaring neither still declares form.
+        assert_eq!(
+            serde_json::to_value(ElicitationCapability::modes(false, false)).unwrap(),
+            serde_json::json!({})
+        );
+
+        // Declared on a client, it round-trips under the `elicitation` key.
+        let caps = ClientCapabilities {
+            elicitation: Some(ElicitationCapability::modes(true, true)),
+            ..ClientCapabilities::default()
+        };
+        let encoded = serde_json::to_value(&caps).unwrap();
+        assert_eq!(
+            encoded["elicitation"],
+            serde_json::json!({"form": {}, "url": {}})
+        );
     }
 }
