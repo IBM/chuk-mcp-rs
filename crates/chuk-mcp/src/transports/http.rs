@@ -70,7 +70,7 @@ impl StreamableHttpParameters {
     }
 
     /// The effective headers: user's, plus User-Agent and Authorization.
-    fn effective_headers(&self) -> HashMap<String, String> {
+    pub(crate) fn effective_headers(&self) -> HashMap<String, String> {
         let mut headers = self.headers.clone();
         if !headers.keys().any(|k| k.eq_ignore_ascii_case("user-agent")) {
             headers.insert("User-Agent".to_string(), self.user_agent.clone());
@@ -125,6 +125,17 @@ impl StreamableHttpTransport {
 
         let semaphore = Arc::new(Semaphore::new(parameters.max_concurrent_requests.max(1)));
         let max_buffer_size = limits.max_buffer_size;
+
+        // The server-to-client stream. Spawned here rather than on demand
+        // because a server may push before the client asks for anything, and
+        // nothing else in this transport is listening for it.
+        tokio::spawn(super::http_listen::listen(
+            client.clone(),
+            parameters.clone(),
+            session_id.clone(),
+            incoming_tx.clone(),
+            max_buffer_size,
+        ));
 
         let task = tokio::spawn(async move {
             while let Some(message) = outgoing_rx.recv().await {
@@ -297,7 +308,7 @@ async fn route_error(
 }
 
 /// Stream and parse an SSE response body, routing JSON-RPC messages.
-async fn stream_sse_response(
+pub(crate) async fn stream_sse_response(
     response: reqwest::Response,
     incoming_tx: &mpsc::Sender<JsonRpcMessage>,
     max_buffer_size: usize,

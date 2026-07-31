@@ -25,9 +25,11 @@
 //! }
 //! ```
 
+mod defaults;
 mod driver;
 mod legacy;
 
+pub use defaults::{schema_defaults, AcceptDefaults};
 pub(crate) use driver::call_with_input;
 pub use driver::MAX_INPUT_ROUNDS;
 pub(crate) use legacy::PushedRequestBridge;

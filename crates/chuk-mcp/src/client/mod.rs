@@ -7,14 +7,18 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::protocol::era::{ProtocolEra, ServerProfile};
-use crate::protocol::messages::initialize::{send_initialize, InitializeResult};
+use crate::protocol::messages::initialize::{
+    send_initialize_with_options, InitializeOptions, InitializeResult,
+};
 use crate::protocol::messages::method::MessageMethod;
 use crate::protocol::messages::ping::send_ping;
 use crate::protocol::messages::prompts::{send_prompts_list, GetPromptResult, Prompt};
 use crate::protocol::messages::resources::{send_resources_list, ReadResourceResult, Resource};
 use crate::protocol::messages::send_message::{ReadStream, SendMessageOptions, WriteStream};
 use crate::protocol::messages::tools::{send_tools_list, Tool, ToolResult};
-use crate::protocol::types::capabilities::ServerCapabilities;
+use crate::protocol::types::capabilities::{
+    ClientCapabilities, ElicitationCapability, ServerCapabilities,
+};
 use crate::protocol::types::errors::McpError;
 use crate::protocol::types::info::ServerInfo;
 use crate::transports::stdio::{StdioParameters, StdioTransport};
@@ -135,9 +139,22 @@ impl McpClient {
     }
 
     /// Perform the MCP initialization handshake (idempotent).
+    ///
+    /// Declares the `elicitation` capability when an input handler is set: a
+    /// legacy server **MUST NOT** push an `elicitation/create` at a client that
+    /// has not said it can answer one, so setting the handler before
+    /// connecting is what makes it reachable.
     pub async fn initialize(&mut self) -> Result<InitializeResult, McpError> {
         let (read, write) = self.transport.get_streams().await?;
-        let result = send_initialize(&read, &write).await?;
+        let result = send_initialize_with_options(
+            &read,
+            &write,
+            InitializeOptions {
+                capabilities: Some(self.declared_capabilities()),
+                ..InitializeOptions::default()
+            },
+        )
+        .await?;
 
         self.server_info = Some(result.server_info.clone());
         self.capabilities = Some(result.capabilities.clone());
@@ -267,6 +284,22 @@ impl McpClient {
     /// The input handler, if one is set.
     pub fn input_handler(&self) -> Option<&Arc<dyn InputHandler>> {
         self.input_handler.as_ref()
+    }
+
+    /// What this client tells a server it can do.
+    ///
+    /// Derived from the handler rather than configured separately, so the two
+    /// cannot disagree — a client that declares elicitation and then cannot
+    /// answer one is worse than one that never declared it.
+    fn declared_capabilities(&self) -> ClientCapabilities {
+        let mut capabilities = ClientCapabilities::default();
+        if let Some(handler) = &self.input_handler {
+            capabilities.elicitation = Some(ElicitationCapability::modes(
+                true,
+                handler.supports_url_mode(),
+            ));
+        }
+        capabilities
     }
 
     /// Ping the server. Returns `false` on failure rather than erroring.

@@ -8,8 +8,11 @@
 //! only exercises the handshake simply ignores the tool traffic, so the tool
 //! calls are best-effort and never fail the run on their own.
 
+use std::sync::Arc;
+
 use serde_json::json;
 
+use chuk_mcp::client::input::AcceptDefaults;
 use chuk_mcp::client::McpClient;
 use chuk_mcp::transports::http::{StreamableHttpParameters, StreamableHttpTransport};
 use chuk_mcp::McpError;
@@ -34,6 +37,14 @@ async fn main() -> std::process::ExitCode {
 async fn run(url: &str) -> Result<(), McpError> {
     let transport = StreamableHttpTransport::start(StreamableHttpParameters::new(url)?)?;
     let mut client = McpClient::new(transport);
+
+    // Answer elicitation from the schema's own defaults. There is no user
+    // behind a conformance run, and the defaults are exactly what a client
+    // "that supports defaults" would have pre-populated the form with — which
+    // is what the SEP-1034 scenarios check for. Set before `initialize` so the
+    // handshake declares the capability; a server must not push an elicitation
+    // at a client that has not said it can answer one.
+    client.set_input_handler(Arc::new(AcceptDefaults));
 
     // Required: the handshake must succeed.
     client.initialize().await?;
