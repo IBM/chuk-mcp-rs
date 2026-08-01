@@ -18,7 +18,8 @@ several areas named below.
 | Transport chosen for you | ✅ from the target string | ❌ name it | ❌ name it | ❌ name it |
 | Era detected per peer | ✅ automatic, cached | ⚙️ `serve_with_lifecycle(Discover)` | ✅ | ✅ |
 | Define a tool (server) | explicit JSON Schema | `#[tool]` macro, schema derived | `@mcp.tool()`, schema from type hints | `registerTool` + Standard Schema |
-| Stateless HTTP **server** | ❌ not built | ✅ default | ✅ | ✅ |
+| Stateless HTTP **server** | ✅ `serve_http` | ✅ default | ✅ | ✅ |
+| Reference server suite | ✅ all 30 scenarios | ✅ | ✅ | ✅ |
 | One library, two languages | ✅ same core | ❌ Rust only | ❌ Python only | ❌ TS only |
 
 ## Connecting
@@ -123,16 +124,16 @@ do not pay.
 
 Stated plainly, because a comparison that only flatters is not useful:
 
-- **Stateless HTTP serving.** rmcp's `StreamableHttpService` serves `2026-07-28`
-  clients without sessions, by default. This library has no HTTP server
-  transport at all — its server is stdio and legacy-only.
-- **Schema derivation.** Covered above.
-- **Client-side features.** Sampling, roots and elicitation handlers are
-  first-class in the official SDKs. Here the message types exist but there is no
-  handler surface, which is why the official conformance suite's
-  `elicitation-sep1034-client-defaults` scenario does not pass.
-- **Ecosystem.** Reference servers, auth helpers and OAuth flows ship with the
-  official SDKs.
+- **Schema derivation.** Covered above. Tools here declare their JSON Schema by
+  hand; every official SDK derives it from the handler's types.
+- **Authorization.** OAuth flows, token handling and the auth-related
+  `2026-07-28` scenarios are absent here and shipped there. This is the largest
+  single gap.
+- **Resource change notifications.** A subscription is recorded, but nothing
+  yet emits `notifications/resources/updated` when a resource changes, nor the
+  `listChanged` notifications.
+- **Ecosystem and maturity.** Reference servers, deployment guides and the
+  weight of being the implementation the spec authors maintain.
 
 ## When this library fits
 
@@ -140,11 +141,12 @@ Stated plainly, because a comparison that only flatters is not useful:
 - You must talk to a mixed fleet where some servers are `2026-07-28` and some
   are not, and you would rather not think about which.
 - You want one protocol implementation behind both your Rust and Python code.
+- You are serving a **local** MCP server and want the rebinding defence on by
+  default rather than remembered.
 
 ## When to reach for the official SDK
 
-- You are **building a server**, especially one served over HTTP.
+- You need **OAuth or any of the authorization flows**.
 - You want schemas derived from types rather than written by hand.
-- You need sampling, roots, elicitation or the OAuth helpers.
 - You want the reference implementation, tracked by the people who write the
   spec.

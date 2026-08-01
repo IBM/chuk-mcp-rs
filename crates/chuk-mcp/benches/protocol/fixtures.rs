@@ -125,3 +125,89 @@ pub fn tools_call_result_value() -> Value {
 /// The method every request fixture uses, re-exported so benchmark modules
 /// never spell it as a literal.
 pub const CALL_METHOD: &str = MessageMethod::TOOLS_CALL;
+
+// --- Server-side fixtures --------------------------------------------------
+
+/// What a tool that fails reports.
+pub const TOOL_FAILURE: &str = "the upstream database refused the connection";
+
+/// A resource template with one variable, the shape the specification's
+/// resource templates use.
+pub const RESOURCE_TEMPLATE: &str = "db://orders/{id}/detail";
+
+/// A URI the template binds.
+pub const RESOURCE_URI_MATCHING: &str = "db://orders/48219/detail";
+
+/// A URI of the same length and shape that the template does not bind, so the
+/// miss is measured against a realistic near-match rather than a short string
+/// that fails on the first byte.
+pub const RESOURCE_URI_UNMATCHING: &str = "db://orders/48219/summary";
+
+/// The three shapes a tool handler's return value comes in. Each takes a
+/// different arm of the result formatter, and they do not cost the same.
+pub fn tool_handler_text() -> Value {
+    json!("Ten orders matched, totalling 419.94 across three regions.")
+}
+
+/// A handler that returns a content block it arranged itself.
+pub fn tool_handler_content_block() -> Value {
+    json!({"type": "image", "data": "iVBORw0KGgoAAAANSUhEUg==", "mimeType": "image/png"})
+}
+
+/// A handler that returns data to be rendered — the arm that has to serialize.
+pub fn tool_handler_data() -> Value {
+    json!({
+        "rows": 10,
+        "region": "emea",
+        "total": 419.94,
+        "orders": [{"order_id": 1, "total": 19.99}, {"order_id": 2, "total": 42.00}],
+    })
+}
+
+/// The headers of an ordinary request to a local server.
+pub fn loopback_headers() -> hyper::header::HeaderMap {
+    headers(&[
+        ("host", "127.0.0.1:3000"),
+        ("origin", "http://localhost:3000"),
+    ])
+}
+
+/// The headers of a DNS-rebinding attempt: the browser is talking to loopback
+/// and says so, but the page asking is not one this server serves.
+pub fn rebinding_headers() -> hyper::header::HeaderMap {
+    headers(&[
+        ("host", "127.0.0.1:3000"),
+        ("origin", "http://evil.example"),
+    ])
+}
+
+fn headers(pairs: &[(&str, &str)]) -> hyper::header::HeaderMap {
+    let mut headers = hyper::header::HeaderMap::new();
+    for (name, value) in pairs {
+        headers.insert(
+            hyper::header::HeaderName::from_bytes(name.as_bytes()).expect("a header name"),
+            value.parse().expect("a header value"),
+        );
+    }
+    headers
+}
+
+/// A progress notification, the message most often framed as an event.
+pub fn progress_notification() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": MessageMethod::NOTIFICATION_PROGRESS,
+        "params": {"progressToken": REQUEST_ID, "progress": 50.0, "total": 100.0},
+    })
+}
+
+/// The params of a `completion/complete` request.
+pub fn completion_params() -> serde_json::Map<String, Value> {
+    json!({
+        "ref": {"type": "ref/prompt", "name": "summarise"},
+        "argument": {"name": "region", "value": "em"},
+    })
+    .as_object()
+    .expect("the completion fixture is an object")
+    .clone()
+}

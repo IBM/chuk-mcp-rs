@@ -12,6 +12,7 @@ mod era;
 mod fixtures;
 mod json_rpc;
 mod results;
+mod server;
 mod versioning;
 
 use criterion::{criterion_group, criterion_main};
@@ -23,5 +24,6 @@ criterion_group!(
     versioning::benches,
     era::benches,
     results::benches,
+    server::benches,
 );
 criterion_main!(benches);

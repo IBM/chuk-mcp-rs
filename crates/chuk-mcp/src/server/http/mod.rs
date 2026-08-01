@@ -16,9 +16,9 @@
 //! ```
 
 mod handler;
-mod origin;
+pub mod origin;
 mod response;
-mod sse;
+pub mod sse;
 
 pub use handler::MCP_PATH;
 pub use origin::AllowedHosts;

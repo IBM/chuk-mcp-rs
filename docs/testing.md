@@ -111,24 +111,46 @@ cargo bench -p chuk-mcp -- envelope     # one group
 
 Groups: `json_rpc` (parse/serialise), `envelope` (`_meta` + mirrored headers +
 parameter promotion), `versioning`, `era` (response classification), `results`
-(decoding and accessors). Fixtures live in one place —
-`benches/protocol/fixtures.rs` — so a number from one group is comparable with
-another's.
+(decoding and accessors), and `server` (the serving-side per-request costs).
+Fixtures live in one place — `benches/protocol/fixtures.rs` — so a number from
+one group is comparable with another's.
 
-Apple M2 Pro, rustc 1.97.1:
+Apple M3 Max, macOS 15.7.4, rustc 1.95.0:
 
-| | |
+| Client side | |
 | --- | --- |
-| Parse a `tools/call` request | 1.76 µs |
-| Parse a `tools/call` response | 3.47 µs |
-| Serialize a request | 1.24 µs |
-| Build a modern envelope | 1.27 µs |
-| Build and promote parameters | 2.11 µs |
-| Encode a header value (plain / Base64) | 31.6 ns / 177 ns |
-| Negotiate a protocol version | 38.7 ns |
-| Classify an HTTP response as modern | 1.2 ns |
-| Decode a tool result | 1.66 µs |
-| Decode a 32-tool catalogue | 43.8 µs |
+| Parse a `tools/call` request | 2.29 µs |
+| Parse a `tools/call` response | 4.46 µs |
+| Serialize a request | 1.35 µs |
+| Build a modern envelope | 1.77 µs |
+| Build and promote parameters | 2.80 µs |
+| Encode a header value (plain / Base64) | 26.4 ns / 183 ns |
+| Negotiate a protocol version | 32.0 ns |
+| Classify an HTTP response as modern | 0.80 ns |
+| Decode a tool result | 2.28 µs |
+| Decode a 32-tool catalogue | 59.2 µs |
+
+| Server side | |
+| --- | --- |
+| Validate `Host`/`Origin` (allowed / refused) | 102 ns / 101 ns |
+| Shape a tool result — text | 665 ns |
+| Shape a tool result — content block passed through | 1.26 µs |
+| Shape a tool result — data rendered as JSON | 1.64 µs |
+| Shape a failure (`isError`) | 628 ns |
+| Frame one SSE event | 645 ns |
+| Match a resource template (hit / miss) | 148 ns / 28.0 ns |
+| Read a `completion/complete` request | 427 ns |
+| Parse a log level | 2.6 ns |
+
+Two things worth reading off the server table. The rebinding check costs about
+100 ns on every HTTP request, which is ~4% of parsing the request that follows
+it — cheap enough that making it the default costs nothing worth having. And a
+tool returning a content block is measurably cheaper than one returning data to
+render, because the rendering arm has to serialize.
+
+These were measured on a different machine from the figures in earlier
+revisions of this file (Apple M2 Pro, rustc 1.97.1), so the change against
+those numbers is the hardware, not this library.
 
 CI compiles the benchmarks but does not run them — the numbers would be noise
 on a shared runner.

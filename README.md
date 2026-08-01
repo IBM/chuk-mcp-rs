@@ -194,6 +194,64 @@ The server speaks **both** eras from the one registration: a legacy client gets
 the `initialize` lifecycle, a `2026-07-28` client gets `server/discover` and
 stateless requests, and the era is decided per request rather than per server.
 
+### Tools that talk while they work
+
+Most tools answer and stop. One that needs to report progress, log what it is
+doing, sample a model, or ask the user something registers differently, and is
+handed a `CallContext`:
+
+```rust
+server.register_interactive_tool(
+    "summarise",
+    json!({"type": "object", "properties": {"text": {"type": "string"}}}),
+    "Summarise some text",
+    |args, ctx| async move {
+        ctx.log("info", json!("starting"));
+        ctx.progress(50.0, Some(100.0));
+
+        // Ask the client's model, and wait for its answer.
+        let reply = ctx.sample(json!({
+            "messages": [{"role": "user", "content": {"type": "text", "text": args["text"]}}],
+            "maxTokens": 100,
+        })).await?;
+
+        Ok(json!(reply["content"]["text"]))
+    },
+);
+```
+
+Over Streamable HTTP the POST that carried the call answers as an event stream:
+what the tool says arrives before its result, and a question it asks is
+answered by a separate POST that the server matches back to the waiting call.
+The distinction between the two registration calls is not cosmetic — the
+transport has to know *before* the call whether the answer needs a stream.
+
+`CallContext::request` fails rather than hangs when the transport has no way
+back to the client (plain stdio) or when the client does not answer in time.
+
+### Serving somewhere other than loopback
+
+`serve_http` answers `localhost`, `127.0.0.0/8` and `::1` only. That is the
+defence against [DNS rebinding][rebinding]: without it, any web page the user
+visits can reach a local MCP server through a hostname that resolves to
+`127.0.0.1`. A server that is meant to be reachable from elsewhere says so:
+
+```rust
+use chuk_mcp::server::http::{serve_http_with, HttpOptions};
+
+serve_http_with(
+    server,
+    "0.0.0.0:3000".parse().unwrap(),
+    HttpOptions::new().allow_host("mcp.example.com"),
+).await
+```
+
+`allow_any_host()` disables the check entirely, which is only correct when
+something else already establishes who is calling — TLS with authentication,
+or a network the server is not reachable from.
+
+[rebinding]: https://github.com/modelcontextprotocol/typescript-sdk/security/advisories/GHSA-w48q-cv73-mx4w
+
 ---
 
 ## Two protocol eras
@@ -263,18 +321,18 @@ Name one yourself when you need to:
 ## Performance
 
 Same MCP server binary, same workload, three clients — 1000 `greet` calls after
-100 warm-up calls, on an Apple M2 Pro (macOS 26.5.2, rustc 1.97.1, CPython
-3.11.11). Reproduce with `python3 -m benchmarks`:
+100 warm-up calls, on an Apple M3 Max (macOS 15.7.4, rustc 1.95.0, CPython
+3.12.2). Reproduce with `python3 -m benchmarks`:
 
 | Client | Mean/call | Calls/sec | p50 | p95 | p99 | Handshake |
 | --- | --- | --- | --- | --- | --- | --- |
-| **rust-native** — the `chuk-mcp` crate | **49.4 µs** | **20,260** | 44.8 µs | 73.7 µs | 102.2 µs | 7.4 ms |
-| **python-bindings** — `chuk_mcp_rs` via PyO3 | 84.4 µs | 11,855 | 81.1 µs | 108.4 µs | 125.7 µs | 12.0 ms |
-| **pure-python** — `chuk-mcp==0.9.4` | 507.6 µs | 1,970 | 498.6 µs | 567.4 µs | 691.2 µs | 13.1 ms |
+| **rust-native** — the `chuk-mcp` crate | **38.6 µs** | **25,907** | 37.5 µs | 45.2 µs | 54.2 µs | 3.7 ms |
+| **python-bindings** — `chuk_mcp_rs` via PyO3 | 72.4 µs | 13,818 | 70.6 µs | 82.0 µs | 98.2 µs | 2.9 ms |
+| **pure-python** — `chuk-mcp==0.9.4` | 427.8 µs | 2,338 | 426.2 µs | 445.6 µs | 470.7 µs | 13.9 ms |
 
 A Python caller that switches to the Rust-backed package gets **6× more tool
 calls per second without changing a line of code**. Dropping Python entirely
-buys another 1.7× — that gap is the PyO3 boundary and the event loop, since the
+buys another 1.9× — that gap is the PyO3 boundary and the event loop, since the
 protocol work is already the same code.
 
 The baseline is pinned to `chuk-mcp==0.9.4` deliberately: it is the last release
@@ -283,15 +341,18 @@ library against itself.
 
 Per-message protocol costs, from `cargo bench -p chuk-mcp`:
 
-| | |
-| --- | --- |
-| Parse a `tools/call` request | 1.76 µs |
-| Serialize a request | 1.24 µs |
-| Build a `2026-07-28` envelope (`_meta` + mirrored headers) | 1.27 µs |
-| …and promote `x-mcp-header` parameters | 2.11 µs |
-| Classify an HTTP response as modern | 1.2 ns |
-| Decode a tool result | 1.66 µs |
-| Negotiate a protocol version | 38.7 ns |
+| Client side | | Server side | |
+| --- | --- | --- | --- |
+| Parse a `tools/call` request | 2.29 µs | Validate `Host`/`Origin` | 102 ns |
+| Serialize a request | 1.35 µs | Shape a text result | 665 ns |
+| Build a `2026-07-28` envelope | 1.77 µs | Shape a rendered result | 1.64 µs |
+| …and promote `x-mcp-header` params | 2.80 µs | Frame one SSE event | 645 ns |
+| Classify an HTTP response as modern | 0.80 ns | Match a resource template | 148 ns |
+| Decode a tool result | 2.28 µs | Read a completion request | 427 ns |
+| Negotiate a protocol version | 32.0 ns | Parse a log level | 2.6 ns |
+
+The rebinding check costs ~100 ns on every HTTP request — a floor under the
+serving path, and about 4% of what parsing the request itself costs.
 
 Method and caveats: [benchmarks/README.md](benchmarks/README.md).
 
@@ -318,9 +379,10 @@ none would show as an absent row, which is where an unimplemented one belongs �
 not hidden behind rules nobody wrote.
 
 **The official `@modelcontextprotocol/conformance` suite**, driving our client
-as a black box. **Every client scenario it offers at a version we support
-passes** — `initialize` and `tools_call` at both `2025-06-18` and `2025-11-25`,
-plus `elicitation-sep1034-client-defaults` and `sse-retry` at `2025-11-25`.
+and our server as black boxes. **Every client scenario it offers at a version
+we support passes** — `initialize` and `tools_call` at both `2025-06-18` and
+`2025-11-25`, plus `elicitation-sep1034-client-defaults` and `sse-retry` at
+`2025-11-25`.
 
 Server-side reference scenarios run too, against the HTTP serving mode, and
 **all 39 checks across 30 scenarios pass** — the lifecycle, logging,
@@ -354,15 +416,18 @@ Full-parity port of the Python package's public surface.
 - **Transports** — stdio, Streamable HTTP in both shapes, the dual-era transports, and the deprecated HTTP+SSE transport.
 - **`2026-07-28`** — per-request `_meta`, mirrored `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` headers, `x-mcp-header` parameter promotion, `server/discover`, era detection and caching, new-request-ID retry on a broken response stream, and the typed result envelope.
 - **Client** — `McpClient`, on any transport, in either era.
-- **Server** — `McpServer` with tool/resource/prompt registration, a protocol handler, and in-memory sessions, served over **stdio or Streamable HTTP**. Answers **both** eras: `server/discover`, per-request version checking and `resultType` stamping for modern callers, the `initialize` lifecycle for legacy ones.
+- **Server** — `McpServer` with tool/resource/prompt registration, resource templates and binary bodies, subscriptions, logging levels and completions, a protocol handler, and in-memory sessions, served over **stdio or Streamable HTTP**. Answers **both** eras: `server/discover`, per-request version checking and `resultType` stamping for modern callers, the `initialize` lifecycle for legacy ones. A tool may talk while it works — progress, logs, sampling and elicitation — answered on an event stream.
+- **Hardening** — `Host`/`Origin` validation against DNS rebinding, bounded request bodies and message buffers, and a timeout on anything the server asks of the client.
 
 Wire compatibility is verified in both directions against the Python
 `chuk_mcp` implementation, and against the official
-`@modelcontextprotocol/conformance` client scenarios in CI.
+`@modelcontextprotocol/conformance` client **and server** scenarios in CI —
+all of both, blocking.
 
-Known gaps: the server has no subscriptions, server-initiated sampling, or
-richer content types, which is what most of the remaining official server
-scenarios exercise. `scripts/run-conformance.sh` prints the current state.
+Known gaps: a subscription is recorded but nothing yet emits
+`notifications/resources/updated` when a resource changes, and the same is true
+of the `listChanged` notifications. `scripts/run-conformance.sh` prints the
+current state.
 
 ---
 

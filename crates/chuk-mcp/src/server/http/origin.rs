@@ -101,7 +101,7 @@ fn origin_host(origin: &str) -> Option<&str> {
 /// Both headers are checked when both are sent. `Origin` is the one a browser
 /// sets and cannot be talked out of, so a request carrying a hostile `Origin`
 /// is refused even where its `Host` looks fine.
-pub(crate) fn check(headers: &HeaderMap, allowed: &AllowedHosts) -> Result<(), String> {
+pub fn check(headers: &HeaderMap, allowed: &AllowedHosts) -> Result<(), String> {
     if let Some(origin) = headers.get(ORIGIN).and_then(|value| value.to_str().ok()) {
         match origin_host(origin) {
             Some(host) if allowed.permits(host) => {}

@@ -36,18 +36,18 @@ it those runners are skipped with a message and the Rust row still prints.
 
 ## Results
 
-Apple M2 Pro, macOS 26.5.2, rustc 1.97.1, CPython 3.11.11 — 1000 calls to
+Apple M3 Max, macOS 15.7.4, rustc 1.95.0, CPython 3.12.2 — 1000 calls to
 `greet` after 100 warm-up calls:
 
 | Client | Handshake | Mean/call | Calls/sec | vs slowest | p50 | p95 | p99 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| rust-native | 7.4 ms | 49.4 µs | 20,260 | 10.3× | 44.8 µs | 73.7 µs | 102.2 µs |
-| python-bindings | 12.0 ms | 84.4 µs | 11,855 | 6.0× | 81.1 µs | 108.4 µs | 125.7 µs |
-| pure-python | 13.1 ms | 507.6 µs | 1,970 | 1.0× | 498.6 µs | 567.4 µs | 691.2 µs |
+| rust-native | 3.7 ms | 38.6 µs | 25,907 | 11.1× | 37.5 µs | 45.2 µs | 54.2 µs |
+| python-bindings | 2.9 ms | 72.4 µs | 13,818 | 5.9× | 70.6 µs | 82.0 µs | 98.2 µs |
+| pure-python | 13.9 ms | 427.8 µs | 2,338 | 1.0× | 426.2 µs | 445.6 µs | 470.7 µs |
 
 Reading it: a Python caller that switches to the Rust-backed package gets
 roughly **6× more tool calls per second** without changing a line of code.
-Dropping Python entirely buys another 1.7×, which is the PyO3 boundary and
+Dropping Python entirely buys another 1.9×, which is the PyO3 boundary and
 the event loop — the protocol work is already identical.
 
 Measured after MRTR landed, so these include the `input_required` check every
@@ -56,13 +56,25 @@ the cost is one field lookup against a result already parsed.
 
 Handshake covers spawning the server *and* the protocol exchange, so it is
 dominated by process start-up; treat it as a rough figure, not a protocol
-measurement.
+measurement. It is also the noisiest column here — a cold binary and a warm one
+differ by more than the protocol work being measured.
+
+**These figures were taken on a different machine from the previous revision**
+(Apple M2 Pro, rustc 1.97.1, CPython 3.11.11), so the change against those
+numbers is the hardware, not this library. The ratios between rows are the
+part worth comparing across runs, and they have barely moved.
 
 ## Scope
 
-Legacy era (`initialize` handshake) only, because the demo server is a legacy
-server. The `2026-07-28` client path has no server here to talk to yet; its
-per-request cost is covered by the `envelope` group in the criterion benches.
+Legacy era (`initialize` handshake) over stdio, because that is what the demo
+server this harness drives speaks. The library's server now answers
+`2026-07-28` and serves over Streamable HTTP as well, but measuring either
+would be a different workload with a different server binary rather than
+another row in this table — what varies here is deliberately only the client.
+
+Until such a row exists, the modern per-request cost is covered by the
+`envelope` group in the criterion benches, and the serving-side costs by the
+`server` group.
 
 ## Adding a client
 

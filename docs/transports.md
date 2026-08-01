@@ -133,6 +133,46 @@ a bound on a hostile one. `0` disables the cap. Every transport has a
 `start_with_limits` alongside `start`; the server side takes
 `McpServer::with_max_buffer_size`.
 
+## Serving
+
+```rust
+use chuk_mcp::server::http::{serve_http, serve_http_with, HttpOptions};
+
+serve_http(server, "127.0.0.1:3000".parse()?).await?;              // loopback only
+serve_http_with(server, address, HttpOptions::new()
+    .allow_host("mcp.example.com")).await?;                        // and this name
+```
+
+Both eras arrive on the same `/mcp` endpoint and are told apart per request.
+
+**`Host` and `Origin` are validated before anything else** — before the path,
+the method, or reading the body. The default answers `localhost`,
+`127.0.0.0/8` and `::1` only, which is what stops a web page the user happens
+to visit from reaching a loopback server through a name that resolves to
+`127.0.0.1` ([GHSA-w48q-cv73-mx4w][rebinding]). A refused request gets `403`
+naming the host. `HttpOptions::allow_any_host()` turns the check off, which is
+only correct behind TLS with authentication or on a network the server is not
+reachable from.
+
+[rebinding]: https://github.com/modelcontextprotocol/typescript-sdk/security/advisories/GHSA-w48q-cv73-mx4w
+
+### When a POST answers with a stream
+
+A call to a tool registered with `register_interactive_tool` is answered as
+`text/event-stream` rather than one JSON body: the tool's notifications and any
+question it asks arrive as events, and its result is the last one. Everything
+else is answered with a single `application/json` body, as before.
+
+Two things have to be true for the stream: the tool was registered as
+interactive, and the client's `Accept` includes `text/event-stream`. A client
+that did not ask for a stream gets the buffered answer, because anything else
+would be unreadable to it.
+
+A question the server asks is answered by a **separate POST** carrying a
+JSON-RPC response. The server matches it back to the waiting call by id and
+answers `202`; an answer nobody is waiting for is dropped rather than mistaken
+for a request.
+
 ## Writing your own
 
 Implement `Transport`:
