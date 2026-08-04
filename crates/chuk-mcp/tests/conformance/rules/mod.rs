@@ -5,12 +5,15 @@
 //! is where an unimplemented one belongs — not hidden behind rules nobody
 //! wrote.
 
+#[cfg(feature = "auth")]
+pub mod auth;
 pub mod cross_era;
 pub mod legacy_client;
 pub mod legacy_server;
 pub mod modern_client;
 pub mod modern_server;
 pub mod mrtr;
+pub mod subscriptions;
 
 use crate::rule::Rule;
 
@@ -21,6 +24,9 @@ pub fn all() -> Vec<Rule> {
     rules.extend(modern_client::rules());
     rules.extend(legacy_server::rules());
     rules.extend(modern_server::rules());
+    rules.extend(subscriptions::rules());
+    #[cfg(feature = "auth")]
+    rules.extend(auth::rules());
     rules.extend(mrtr::rules());
     rules.extend(cross_era::rules());
     rules

@@ -35,6 +35,9 @@ struct Options {
     env: Option<HashMap<String, String>>,
     credential_context: Option<String>,
     input_handler: Option<Arc<dyn InputHandler>>,
+    /// OAuth configuration, when the caller supplied any.
+    #[cfg(feature = "auth")]
+    auth: Option<crate::auth::Auth>,
 }
 
 impl Default for Options {
@@ -42,6 +45,8 @@ impl Default for Options {
         Options {
             mode: EraMode::default(),
             identity: ClientIdentity::chuk(),
+            #[cfg(feature = "auth")]
+            auth: None,
             timeout: None,
             limits: TransportLimits::default(),
             bearer_token: None,
@@ -155,6 +160,18 @@ impl Connect {
         self
     }
 
+    /// Authorize against a protected server.
+    ///
+    /// Without this a `401` is reported as the transport failure it is. With
+    /// it, the challenge is answered: metadata discovered, a client registered,
+    /// the user sent to the authorization server, and the token attached to
+    /// every request after.
+    #[cfg(feature = "auth")]
+    pub fn authorization(mut self, auth: crate::auth::Auth) -> Connect {
+        self.options.auth = Some(auth);
+        self
+    }
+
     /// Answer servers that ask for user input.
     ///
     /// Also declares the matching `elicitation` capability, in the modern
@@ -215,6 +232,8 @@ impl Options {
     }
 
     async fn connect_http(self, url: String) -> Result<McpClient, McpError> {
+        #[cfg(feature = "auth")]
+        let url_for_auth = url.clone();
         let mut parameters = DualEraHttpParameters::new(url)?
             .with_mode(self.mode)
             .with_headers(self.headers);
@@ -230,6 +249,16 @@ impl Options {
             parameters = parameters.with_credential_context(context);
         }
 
+        // Built here rather than in the transport: the session is per
+        // endpoint, and the transport is the thing being pointed at it.
+        #[cfg(feature = "auth")]
+        if let Some(auth) = self.auth.clone() {
+            parameters.auth = Some(std::sync::Arc::new(crate::auth::AuthSession::new(
+                auth,
+                &url_for_auth,
+            )));
+        }
+
         let transport = DualEraHttpTransport::start_with_limits(parameters, self.limits)?;
         let (read, write) = transport.get_streams().await?;
 
@@ -237,6 +266,18 @@ impl Options {
         // issued here, deliberately, rather than leaving the caller's first
         // call to discover the era by accident.
         let profile = settle(&read, &write, self.mode, &self.identity, self.timeout).await?;
+
+        // Tell the transport what the handshake settled. Without this the two
+        // can disagree — see `DualEraHttpTransport::set_era` — and a legacy
+        // peer would be driven down the modern path for every request after
+        // the handshake that proved it legacy.
+        transport.set_era(profile.era);
+
+        // A legacy peer answers server-initiated requests on a `GET` stream
+        // that has to exist before the first call goes out. Opening it is a
+        // round trip; waiting for it here is what stops the caller's first
+        // request racing it.
+        transport.ready().await;
 
         let mut client = McpClient::from_profile(transport, read, write, profile);
         if let Some(handler) = self.input_handler {

@@ -8,12 +8,12 @@ use serde_json::{json, Value};
 
 use crate::protocol::json_rpc::{create_error_response, JsonRpcMessage};
 use crate::protocol::messages::method::MessageMethod;
-use crate::protocol::types::errors::{INTERNAL_ERROR, INVALID_PARAMS};
+use crate::protocol::types::errors::{INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
 
 use super::{
     context::CallContext, discover, modern, params_object, prompts, CompletionRequest,
-    HandlerResult, LogLevel, McpServer, FIELD_ARGUMENTS, FIELD_LEVEL, FIELD_META, FIELD_NAME,
-    FIELD_PROGRESS_TOKEN, FIELD_URI,
+    HandlerResult, LogLevel, McpServer, NotificationFilter, FIELD_ARGUMENTS, FIELD_INPUT_RESPONSES,
+    FIELD_LEVEL, FIELD_META, FIELD_NAME, FIELD_PROGRESS_TOKEN, FIELD_REQUEST_STATE, FIELD_URI,
 };
 
 impl McpServer {
@@ -71,9 +71,65 @@ impl McpServer {
             }
         }
 
+        // Methods this revision removed are answered as the unknown methods
+        // they now are. Serving one would tell the client the stateful
+        // lifecycle is still here.
+        if modern {
+            if let Some(method) = message.method() {
+                if modern::is_removed_method(method) {
+                    return (
+                        self.fail(
+                            &message,
+                            METHOD_NOT_FOUND,
+                            &format!("Method not found: {method} was removed in 2026-07-28"),
+                        ),
+                        None,
+                    );
+                }
+            }
+        }
+
+        // Which operation this is decides whether its result is cacheable, and
+        // the message is about to be consumed by the dispatch that answers it.
+        let method = message.method().map(str::to_string);
+
+        // State the client carried back is checked before anything acts on it.
+        // With no session, the client has been holding what the server needs
+        // to remember, so an unverified state is state an unrelated caller
+        // could have written.
+        let carried_state = round_trip_field(&message, FIELD_REQUEST_STATE);
+        if let (Some(validator), Some(state)) = (
+            self.request_state_validator.as_ref(),
+            carried_state.as_ref().and_then(Value::as_str),
+        ) {
+            if !validator(state) {
+                return (
+                    self.fail(
+                        &message,
+                        INVALID_PARAMS,
+                        "requestState failed integrity verification",
+                    ),
+                    None,
+                );
+            }
+        }
+
+        // A retry carries its answers and the state it was given beside the
+        // arguments rather than inside them, so a handler reaching for them
+        // through its arguments would never find them. Attached here, where
+        // every transport passes through, rather than in each one.
+        let context = context.with_round_trip(
+            round_trip_field(&message, FIELD_INPUT_RESPONSES),
+            carried_state
+                .as_ref()
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            modern::declared_capabilities(&message),
+        );
+
         let (mut response, session) = self.dispatch(message, session_id, context).await;
         if let Some(response) = response.as_mut() {
-            modern::finish_response(response, modern);
+            modern::finish_response(response, modern, method.as_deref(), &self.cache_policy);
         }
         (response, session)
     }
@@ -100,12 +156,15 @@ impl McpServer {
             Some(MessageMethod::RESOURCES_TEMPLATES_LIST) => {
                 self.answer(&message, self.resources.templates_list_result())
             }
+            Some(MessageMethod::SUBSCRIPTIONS_LISTEN) => self.listen(&message, &context),
             Some(MessageMethod::RESOURCES_SUBSCRIBE) => self.subscribe(&message, true),
             Some(MessageMethod::RESOURCES_UNSUBSCRIBE) => self.subscribe(&message, false),
             Some(MessageMethod::PROMPTS_LIST) => {
                 self.answer(&message, prompts::list_result(&self.prompts))
             }
-            Some(MessageMethod::PROMPTS_GET) => return (self.get_prompt(&message).await, None),
+            Some(MessageMethod::PROMPTS_GET) => {
+                return (self.get_prompt(&message, &context).await, None)
+            }
             Some(MessageMethod::LOGGING_SET_LEVEL) => self.set_log_level(&message),
             Some(MessageMethod::COMPLETION_COMPLETE) => {
                 return (self.complete(&message).await, None)
@@ -157,6 +216,19 @@ impl McpServer {
             .unwrap_or_default();
         let arguments = params.get(FIELD_ARGUMENTS).cloned().unwrap_or(json!({}));
 
+        // A tool that needs the client to be able to answer it cannot run for
+        // a client that never said it could. Checked here rather than inside
+        // the handler so the refusal is a protocol error the client can act
+        // on, not a tool result reporting a failure after the fact.
+        let missing = self.missing_capabilities(message);
+        if !missing.is_empty() {
+            let (code, text, data) = modern::missing_capability_error(&missing);
+            let id = message.id()?.clone();
+            return Some(JsonRpcMessage::Error(create_error_response(
+                id, code, &text, data,
+            )));
+        }
+
         match self.tools.call(name, arguments, context).await {
             Some(result) => self.answer(message, result),
             // An unknown tool is an invalid call, not a tool that failed.
@@ -185,7 +257,11 @@ impl McpServer {
         }
     }
 
-    async fn get_prompt(&self, message: &JsonRpcMessage) -> Option<JsonRpcMessage> {
+    async fn get_prompt(
+        &self,
+        message: &JsonRpcMessage,
+        context: &CallContext,
+    ) -> Option<JsonRpcMessage> {
         let params = params_object(message);
         let name = params
             .get(FIELD_NAME)
@@ -197,10 +273,32 @@ impl McpServer {
             .cloned()
             .unwrap_or_default();
 
-        match prompts::get_result(&self.prompts, name, arguments).await {
+        match prompts::get_result(&self.prompts, name, arguments, context).await {
             Ok(result) => self.answer(message, result),
             Err((code, text)) => self.fail(message, code, &text),
         }
+    }
+
+    /// `subscriptions/listen`: hold this request open as a notification stream.
+    ///
+    /// Answers nothing now. The response to a `subscriptions/listen` is not the
+    /// acknowledgement — that is a notification the registry sends immediately
+    /// — but the empty result that marks a *graceful close*, which is owed only
+    /// when the server ends the subscription itself. Returning a result here
+    /// would close the stream in the act of opening it.
+    fn listen(&self, message: &JsonRpcMessage, context: &CallContext) -> Option<JsonRpcMessage> {
+        let id = message.id()?.clone();
+        let Some(outbound) = context.outbound() else {
+            return self.fail(
+                message,
+                INVALID_PARAMS,
+                "this transport has no channel to carry a subscription stream",
+            );
+        };
+
+        let filter = NotificationFilter::from_params(&Value::Object(params_object(message)));
+        self.listeners.open(id, filter, outbound.clone());
+        None
     }
 
     /// `resources/subscribe` and its opposite. The client is asking to be told
@@ -264,7 +362,30 @@ impl McpServer {
             progress_token(message),
             self.client_timeout,
         )
+        .with_log_floor(self.log_floor_for(message))
     }
+
+    /// How much this particular call is allowed to log.
+    ///
+    /// The two eras answer this from different places, and the difference is
+    /// the point: a legacy client sets a level once with `logging/setLevel`
+    /// and it applies until changed, while a modern request carries its own
+    /// level and a request that carried none gets silence. A server that
+    /// applied the legacy default to a modern request would emit
+    /// `notifications/message` to a client that never asked for it, which the
+    /// specification forbids outright.
+    fn log_floor_for(&self, message: &JsonRpcMessage) -> Option<LogLevel> {
+        if !modern::is_modern_request(message) {
+            return Some(self.log_level.get());
+        }
+        let params = message.params()?;
+        LogLevel::parse(crate::protocol::meta::log_level_of(params)?)
+    }
+}
+
+/// One of the multi round-trip fields a request carried, if it carried it.
+fn round_trip_field(message: &JsonRpcMessage, field: &str) -> Option<Value> {
+    message.params()?.get(field).cloned()
 }
 
 /// The progress token a request asked its progress be reported under.

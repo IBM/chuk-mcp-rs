@@ -7,6 +7,7 @@
 //! harness can read it.
 
 mod media;
+mod modern;
 mod prompts;
 mod resources;
 mod tools;
@@ -52,9 +53,16 @@ fn conformance_server() -> McpServer {
         env!("CARGO_PKG_VERSION"),
         Some(capabilities()),
     )
-    .with_instructions("A server used to exercise the MCP conformance suite.");
+    .with_instructions("A server used to exercise the MCP conformance suite.")
+    // Every `requestState` this server mints is one of two known constants, so
+    // anything else came back edited — which is exactly what the tampered-state
+    // scenario sends, and what a server MUST refuse.
+    .with_request_state_validator(|state| {
+        matches!(state, modern::STATE_ROUND_1 | modern::STATE_ROUND_2)
+    });
 
     tools::register(&mut server);
+    modern::register(&mut server);
     resources::register(&mut server);
     prompts::register(&mut server);
 

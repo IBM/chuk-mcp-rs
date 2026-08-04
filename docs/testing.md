@@ -14,6 +14,9 @@ Four things run against this repo, answering four different questions.
 ```bash
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+
+# `auth` is a default feature, so nothing above exercises it being off.
+cargo test -p chuk-mcp --no-default-features
 ```
 
 CI holds every file in the core crate at **≥90% line coverage individually**
@@ -45,8 +48,8 @@ both.protocol.result-type-default            both        protocol  pass
 Coverage:
   legacy      client    6 rules
   legacy      server    10 rules
-  2026-07-28  client    10 rules
-  2026-07-28  server    5 rules
+  2026-07-28  client    19 rules
+  2026-07-28  server    14 rules
   2026-07-28  protocol  3 rules
   both        protocol  8 rules
 ```
@@ -83,20 +86,40 @@ now passes**, so the known-gaps list is empty; the script still prints the
 section, so a new entry is visible the moment one appears.
 
 Server-side reference scenarios run against `chuk-mcp-conformance-server` over
-the HTTP serving mode, and **all 39 checks across 30 scenarios pass** — so the
-stage blocks, and anything that stops passing is a regression rather than news.
-That covers logging, completion, subscriptions, URI templates, binary
-resources, every content type, and the three server-initiated exchanges
-(progress, sampling and elicitation).
+the HTTP serving mode, in two stages that both block:
+
+- **`2025-11-25`** — all 39 checks across 30 scenarios. Logging, completion,
+  subscriptions, URI templates, binary resources, every content type, and the
+  three server-initiated exchanges (progress, sampling and elicitation).
+- **`2026-07-28`** — all 40 scenarios the suite defines for the revision.
+  Statelessness and `_meta` validation, caching hints, header and
+  custom-header validation, `subscriptions/listen`, JSON Schema 2020-12
+  preservation, and the multi round-trip family.
+
+The modern stage names every scenario in `MODERN_SERVER_SCENARIOS` rather than
+taking the suite's default run, because several 2026-07-28 scenarios are only
+reached by naming them — a wildcard would silently skip them and report
+success. A scenario missing from that list is a scenario nobody is running, so
+adding one is how coverage grows.
 
 The fixtures each scenario expects live in
-`crates/chuk-mcp/src/bin/conformance_server/`, one module per kind. A scenario
-that fails with `Unknown tool`/`Unknown prompt`/`Unknown resource` is missing
-its fixture, not a protocol feature — worth checking before concluding
-anything deeper is wrong.
+`crates/chuk-mcp/src/bin/conformance_server/`, one module per kind, with the
+2026-era diagnostic tools in `modern.rs`. A scenario that fails with
+`Unknown tool`/`Unknown prompt`/`Unknown resource` is missing its fixture, not
+a protocol feature — worth checking before concluding anything deeper is wrong.
 
-The upstream draft (`2026-07-28`) client scenarios are auth-only, which is why
-the modern era is covered in-repo rather than upstream.
+The `2026-07-28` *client* scenarios run as their own stage —
+`MODERN_CLIENT_SCENARIOS` — covering everything the revision defines for a
+client, authorization included. `LEGACY_AUTH_SCENARIOS` re-runs the
+authorization ones at `2025-11-25`, because the two eras reach the token
+through different transports and a fix to one says nothing about the other.
+
+Only the authorization *extensions* are absent (DPoP, client credentials, JWT
+bearer, enterprise-managed): separate optional specifications this library does
+not implement.
+
+The modern scenarios come from a `0.2.0` prerelease of the suite, pinned to an
+exact version in `CONFORMANCE_MODERN`.
 
 ## Micro-benchmarks
 

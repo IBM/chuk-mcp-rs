@@ -363,14 +363,14 @@ Method and caveats: [benchmarks/README.md](benchmarks/README.md).
 Two suites, both blocking in CI — `./scripts/run-conformance.sh`:
 
 **Our own rule suite**, spec requirements expressed as data and run against this
-client and this server in both eras. 42 of 42 rules hold:
+client and this server in both eras. 60 of 60 rules hold:
 
 | Era | Subject | Rules | Covers |
 | --- | --- | --- | --- |
 | legacy | client | 6 | `initialize` first, required params, `notifications/initialized`, unique ids, `tools/call` shape, version pushed to the transport |
-| `2026-07-28` | client | 10 | `_meta` version + capabilities, the three mirrored headers, parameter promotion, header encoding, no session header, `server/discover`, opaque `requestState` |
+| `2026-07-28` | client | 19 | `_meta` version + capabilities, the three mirrored headers, parameter promotion, header encoding, no session header, `server/discover`, opaque `requestState`, and the nine authorization rules — discovery order, issuer and resource validation, the `iss` table, no normalisation, scope union, PKCE, challenge parsing |
 | legacy | server | 10 | `initialize` result, version negotiation, id echo, `tools/list` shape, tool errors, `-32601`, `ping`, notifications unanswered, `resources/read` |
-| `2026-07-28` | server | 5 | `server/discover` shape and statelessness, `resultType` on every result, legacy requests left alone, unsupported versions rejected with the list |
+| `2026-07-28` | server | 14 | `server/discover` shape and statelessness, `resultType` on every result, legacy requests left alone, unsupported versions rejected with the list and the request echoed, caching hints on exactly the cacheable results, `_meta` validation, removed methods gone, and the four `subscriptions/listen` rules |
 | `2026-07-28` | protocol | 3 | `input_required` decoding, the methods that may carry it, at-least-one-field |
 | both | protocol | 8 | `resultType` defaulting and preservation, `isError`, batch parsing, era classification, negotiation failure, elicitation modes and actions |
 
@@ -384,14 +384,29 @@ we support passes** — `initialize` and `tools_call` at both `2025-06-18` and
 `2025-11-25`, plus `elicitation-sep1034-client-defaults` and `sse-retry` at
 `2025-11-25`.
 
-Server-side reference scenarios run too, against the HTTP serving mode, and
-**all 39 checks across 30 scenarios pass** — the lifecycle, logging,
-completion, subscriptions, URI templates, binary resources, every content type,
-and the server-initiated exchanges (progress, sampling, elicitation). Blocking,
-like the client scenarios.
+Server-side reference scenarios run too, against the HTTP serving mode, in
+**both** eras and blocking in each:
 
-The upstream draft (`2026-07-28`) client scenarios are auth-only, which is why
-the modern era is covered by the in-repo suite instead.
+- **`2025-11-25`** — all 39 checks across 30 scenarios: the lifecycle, logging,
+  completion, subscriptions, URI templates, binary resources, every content
+  type, and the server-initiated exchanges (progress, sampling, elicitation).
+- **`2026-07-28`** — all 40 scenarios the suite defines for the revision,
+  named explicitly in `run-conformance.sh` because its default run does not
+  reach them all. Statelessness and `_meta` validation, the caching hints,
+  header validation and custom-header promotion, `subscriptions/listen`,
+  JSON Schema 2020-12 preservation, and the full multi round-trip family.
+
+The `2026-07-28` **client** scenarios run too — all 30 of them, authorization
+included: discovery variants, Client ID Metadata Documents, pre-registration,
+PKCE, the `resource` parameter, every `iss` validation case, scope selection
+and step-up, the three token-endpoint auth methods, `offline_access`, and
+authorization-server migration. The eight that also exist at `2025-11-25` are
+run there as well, because the two eras reach the token through different
+transports.
+
+The modern scenarios live in a `0.2.0` prerelease of the suite and are pinned
+to an exact version, so a scenario appearing overnight arrives as a deliberate
+bump rather than a red build nobody changed.
 
 Details: [docs/testing.md](docs/testing.md).
 
@@ -404,30 +419,108 @@ Details: [docs/testing.md](docs/testing.md).
 - **[docs/python.md](docs/python.md)** — the full Python surface, including the low-level `send_*` API.
 - **[docs/testing.md](docs/testing.md)** — tests, the conformance suite, the benchmarks.
 - **[docs/comparison.md](docs/comparison.md)** — how this compares with the official MCP SDKs.
+- **[CHANGELOG.md](CHANGELOG.md)** — what changed, and why, release by release.
 
 ---
 
 ## Status
 
-Full-parity port of the Python package's public surface.
+Full-parity port of the Python package's public surface, plus the
+`2026-07-28` revision in both directions and OAuth 2.1 authorization.
 
 - **Protocol** — JSON-RPC 2.0 (request / notification / response / error / batch), MCP types, version negotiation across `2026-07-28`, `2025-11-25`, `2025-06-18`, `2025-03-26` and `2024-11-05`, and version-gated batching.
 - **Messages** — `initialize`, `tools/*`, `resources/*`, `prompts/*`, `ping`, `logging/setLevel`, `completion/complete`, `sampling/createMessage`, `roots/*`, all notifications, with cancellation and progress.
 - **Transports** — stdio, Streamable HTTP in both shapes, the dual-era transports, and the deprecated HTTP+SSE transport.
-- **`2026-07-28`** — per-request `_meta`, mirrored `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` headers, `x-mcp-header` parameter promotion, `server/discover`, era detection and caching, new-request-ID retry on a broken response stream, and the typed result envelope.
+- **`2026-07-28`** — per-request `_meta`, mirrored `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` headers, `x-mcp-header` parameter promotion, `server/discover`, `subscriptions/listen`, `ttlMs` / `cacheScope` caching hints, era detection and caching, new-request-ID retry on a broken response stream, and the typed result envelope. Serving it also means enforcing it: headers checked against the body, `_meta` required, removed methods answered `404`, and no log notification for a request that did not ask for one.
 - **Client** — `McpClient`, on any transport, in either era.
 - **Server** — `McpServer` with tool/resource/prompt registration, resource templates and binary bodies, subscriptions, logging levels and completions, a protocol handler, and in-memory sessions, served over **stdio or Streamable HTTP**. Answers **both** eras: `server/discover`, per-request version checking and `resultType` stamping for modern callers, the `initialize` lifecycle for legacy ones. A tool may talk while it works — progress, logs, sampling and elicitation — answered on an event stream.
+- **Authorization** — OAuth 2.1 over HTTP: protected-resource and authorization-server metadata discovery, Client ID Metadata Documents / pre-registration / Dynamic Client Registration, PKCE `S256`, the `resource` parameter, RFC 9207 `iss` validation, scope selection and step-up, refresh tokens, and credentials keyed by issuer. Behind the default-on `auth` feature; see [Authorizing](#authorizing).
 - **Hardening** — `Host`/`Origin` validation against DNS rebinding, bounded request bodies and message buffers, and a timeout on anything the server asks of the client.
 
 Wire compatibility is verified in both directions against the Python
 `chuk_mcp` implementation, and against the official
 `@modelcontextprotocol/conformance` client **and server** scenarios in CI —
-all of both, blocking.
+all of both, blocking, at `2025-11-25` **and** `2026-07-28`.
 
-Known gaps: a subscription is recorded but nothing yet emits
-`notifications/resources/updated` when a resource changes, and the same is true
-of the `listChanged` notifications. `scripts/run-conformance.sh` prints the
-current state.
+**Not covered.** The authorization *extensions* — DPoP, client credentials,
+JWT bearer, enterprise-managed — are separate optional specifications and are
+not implemented, nor is `private_key_jwt` client authentication. The
+`io.modelcontextprotocol/tasks` extension is likewise absent; it is an
+extension rather than core protocol, and nothing here advertises it.
+
+---
+
+## Roadmap
+
+What is deliberately not here yet, and what would have to be true before it is.
+
+| | Why it is not here | What it needs |
+| --- | --- | --- |
+| **Authorization extensions** — DPoP, client credentials, JWT bearer, enterprise-managed | Separate optional specifications the core revision explicitly does not require | Real signing crypto (DPoP proofs, `private_key_jwt`), which is a dependency and a key-handling story this crate has so far avoided |
+| **`io.modelcontextprotocol/tasks`** | An extension, not core protocol | A decision about whether extensions belong in this crate or beside it — the `extensions` capability field is already parsed either way |
+| **Persistent token storage** | The crate should not choose where your secrets live | Nothing in the library: implement [`TokenStore`](https://docs.rs/chuk-mcp/latest/chuk_mcp/auth/store/trait.TokenStore.html). A keychain-backed implementation would be a separate crate |
+| **A browser-opening `AuthorizationHandler`** | Opening a browser is desktop I/O, and a protocol library doing it by default is how a headless service ends up launching one | A small companion crate, or four lines in your application |
+| **Validation against a real authorization server** | Everything so far is verified against the reference suite's mock | Time against a production identity provider. See the caveat below |
+
+**One caveat worth stating plainly.** The authorization code is verified against
+the official conformance suite's mock authorization server and nothing else. A
+real provider brings consent screens, token rotation, clock skew and error
+responses that no mock reproduces. It conforms; it has not yet been *lived
+with*. Treat the first production integration as the real test, and please open
+an issue with what you find.
+
+---
+
+## Authorizing
+
+A server that answers `401` is asking for a token. Supply an `Auth` and the
+client does the rest — discovery, registration, PKCE, the token exchange, and
+attaching the token to every request after:
+
+```rust
+use std::sync::Arc;
+use chuk_mcp::auth::{Auth, AuthorizationHandler};
+
+struct OpenBrowser;
+
+#[async_trait::async_trait]
+impl AuthorizationHandler for OpenBrowser {
+    async fn authorize(&self, url: &str) -> Result<(), chuk_mcp::McpError> {
+        println!("Authorize here: {url}");
+        Ok(())
+    }
+}
+
+let client = Connect::to("https://mcp.example.com/mcp")
+    .authorization(Auth::new().handler(Arc::new(OpenBrowser)))
+    .connect()
+    .await?;
+```
+
+The one thing the library cannot do is put the authorization page in front of a
+person, so that is the one thing you supply — and it is not optional: without a
+handler the first challenge fails with an error saying so. The default is
+deliberately inert, because the convenient alternative (fetching the
+authorization URL from this process) would let a server direct an outbound
+request from your client to an address of its choosing. `auth::FollowRedirect`
+does exactly that and is available for unattended clients that want it.
+
+Everything either side of the hand-off — binding the loopback listener, waiting
+for the redirect, validating `state` and `iss`, redeeming the code — happens
+here.
+
+Tokens live in memory by default and are never written to disk: where a refresh
+token may safely be kept is a decision about your system, not one a protocol
+library should make. Implement `TokenStore` to persist them.
+
+Three things worth knowing:
+
+- **Pre-registered credentials** — `Auth::new().identity(ClientIdentity::named("my-app").with_client_secret(id, secret))`.
+- **Client ID Metadata Documents** — `.with_metadata_document("https://app.example/client.json")`, used when the authorization server advertises support. No registration call, and the identity is portable across servers.
+- **Step-up** — a `403` with `insufficient_scope` re-authorizes for the union of what is held and what was asked for, bounded by `max_scope_upgrades` so a server challenging in a loop is stopped rather than followed.
+
+Not implemented: the authorization *extensions* (DPoP, client credentials, JWT
+bearer) and `private_key_jwt`.
 
 ---
 
@@ -440,8 +533,15 @@ cargo clippy --workspace --all-targets  # lints
 cargo bench -p chuk-mcp                 # protocol micro-benchmarks
 python3 -m benchmarks                   # end-to-end: Rust vs PyO3 vs pure Python
 
+# `auth` is a default feature, so nothing above exercises it being off.
+cargo test -p chuk-mcp --no-default-features
+
 cd crates/chuk-mcp-python && maturin develop   # build the extension into a venv
 ```
+
+CI additionally holds every file in the core crate at **≥90% line coverage
+individually** — a crate total would let a new file arrive untested behind the
+rest. See [docs/testing.md](docs/testing.md).
 
 ---
 

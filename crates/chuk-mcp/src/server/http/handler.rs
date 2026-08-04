@@ -8,11 +8,12 @@ use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use tokio::sync::mpsc;
 
-use crate::protocol::json_rpc::{parse_message_str, JsonRpcMessage};
+use crate::protocol::json_rpc::{create_error_response, parse_message_str, JsonRpcMessage};
 use crate::server::McpServer;
 
 use super::response::{self, Body};
 use super::sse;
+use super::validate;
 
 /// The path this server answers on. The specification puts both directions of
 /// Streamable HTTP on one endpoint.
@@ -60,7 +61,7 @@ pub(crate) async fn handle(
             };
             let session = header(response::SESSION_HEADER);
             let accept = header(hyper::header::ACCEPT.as_str());
-            post(server, body, session, accept).await
+            post(server, body, session, accept, &parts.headers).await
         }
         // The server-to-client stream. Accepted and held open by a server that
         // has something to push; this one answers everything on the POST that
@@ -80,6 +81,7 @@ async fn post(
     body: Incoming,
     session: Option<String>,
     accept: Option<String>,
+    headers: &hyper::HeaderMap,
 ) -> Response<Body> {
     // Bounded before reading: a body that never ends would otherwise be read
     // until the process ran out of memory.
@@ -110,6 +112,32 @@ async fn post(
         }
     };
 
+    // A 2026-era request must describe itself the same way in its headers and
+    // its body. Checked before anything is dispatched, because the point of
+    // the mirrored headers is that an intermediary may act on them — so a
+    // request whose two halves disagree must not be executed at all.
+    let modern = validate::presents_as_modern(headers);
+    if modern {
+        if let Some(rejection) = validate::check(&server, headers, &message) {
+            tracing::warn!("refused a request: {}", rejection.message);
+            return match message.id().cloned() {
+                Some(id) => response::json_with_status(
+                    &JsonRpcMessage::Error(create_error_response(
+                        id,
+                        rejection.code,
+                        &rejection.message,
+                        None,
+                    )),
+                    None,
+                    StatusCode::BAD_REQUEST,
+                ),
+                // A notification has no id to answer against, so the status is
+                // the whole of the reply.
+                None => response::text_error(StatusCode::BAD_REQUEST, &rejection.message),
+            };
+        }
+    }
+
     // A call to a tool that talks while it works cannot be answered with one
     // JSON body: what it says has to reach the client before the result does.
     if server.needs_stream(&message) && sse::accepts_event_stream(accept.as_deref()) {
@@ -119,7 +147,7 @@ async fn post(
     let (answer, assigned) = server.handle_message(message, session.as_deref()).await;
 
     match answer {
-        Some(answer) => response::json(&answer, assigned.as_deref()),
+        Some(answer) => response::json(&answer, assigned.as_deref(), modern),
         // A notification, or an answer to something this server asked. Neither
         // earns a reply, which is the difference between them and a request.
         None => response::accepted(),

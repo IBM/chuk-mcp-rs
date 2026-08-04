@@ -56,7 +56,202 @@ pub fn rules() -> Vec<Rule> {
             "An unsupported declared version is rejected with -32022 and the supported list",
             rejects_an_unsupported_version,
         ),
+        Rule::new(
+            "modern.server.cacheable-results-carry-hints",
+            Era::Modern,
+            Subject::Server,
+            "Every cacheable result carries `ttlMs` (>= 0) and `cacheScope` (public|private)",
+            cacheable_results_carry_hints,
+        ),
+        Rule::new(
+            "modern.server.non-cacheable-results-carry-none",
+            Era::Modern,
+            Subject::Server,
+            "A result of an operation the specification does not list as cacheable carries no hints",
+            non_cacheable_results_carry_no_hints,
+        ),
+        Rule::new(
+            "modern.server.rejects-missing-meta",
+            Era::Modern,
+            Subject::Server,
+            "A modern request missing `_meta` protocolVersion or clientCapabilities is refused with -32602",
+            rejects_missing_meta,
+        ),
+        Rule::new(
+            "modern.server.removed-methods-are-gone",
+            Era::Modern,
+            Subject::Server,
+            "The RPCs this revision removed answer -32601, while a legacy request still gets them",
+            removed_methods_are_gone,
+        ),
+        Rule::new(
+            "modern.server.unsupported-version-echoes-request",
+            Era::Modern,
+            Subject::Server,
+            "The unsupported-version error echoes the requested version alongside the supported list",
+            unsupported_version_echoes_the_request,
+        ),
     ]
+}
+
+/// The cacheable operations that take no parameters.
+///
+/// `resources/read` is the sixth, and is exercised by the suite's own
+/// `caching` scenario rather than here: it needs a URI, which is a fixture
+/// detail rather than a statement about caching.
+const CACHEABLE: [&str; 5] = [
+    MessageMethod::SERVER_DISCOVER,
+    MessageMethod::TOOLS_LIST,
+    MessageMethod::PROMPTS_LIST,
+    MessageMethod::RESOURCES_LIST,
+    MessageMethod::RESOURCES_TEMPLATES_LIST,
+];
+
+async fn cacheable_results_carry_hints() -> Verdict {
+    for method in CACHEABLE {
+        let result = modern_ask(method, json!({})).await?;
+
+        let ttl = result.get("ttlMs").and_then(Value::as_i64).ok_or_else(|| {
+            format!("{method}: no ttlMs, so a client has nothing to judge freshness by")
+        })?;
+        expect(
+            ttl >= 0,
+            format!("{method}: ttlMs is {ttl}, which the specification forbids"),
+        )?;
+
+        let scope = result.get("cacheScope").and_then(Value::as_str);
+        expect(
+            matches!(scope, Some("public") | Some("private")),
+            format!("{method}: cacheScope is {scope:?}, not \"public\" or \"private\""),
+        )?;
+    }
+    Ok(())
+}
+
+async fn non_cacheable_results_carry_no_hints() -> Verdict {
+    // A tool call is an action, not a document: caching one would replay a
+    // side effect.
+    let result = modern_ask(
+        MessageMethod::TOOLS_CALL,
+        json!({"name": TOOL_NAME, "arguments": {TOOL_ARGUMENT: "world"}}),
+    )
+    .await?;
+
+    expect(
+        result.get("ttlMs").is_none() && result.get("cacheScope").is_none(),
+        "tools/call carried caching hints, inviting a client to replay its result",
+    )
+}
+
+async fn rejects_missing_meta() -> Verdict {
+    use chuk_mcp::protocol::types::errors::INVALID_PARAMS;
+
+    // Each of the three ways the block can be unusable.
+    for (what, params) in [
+        ("no _meta at all", json!({})),
+        (
+            "no protocolVersion",
+            json!({"_meta": {"io.modelcontextprotocol/clientCapabilities": {}}}),
+        ),
+        (
+            "no clientCapabilities",
+            json!({"_meta": {"io.modelcontextprotocol/protocolVersion": versioning::CURRENT_VERSION}}),
+        ),
+    ] {
+        let missing = modern::missing_required_meta(&JsonRpcMessage::Request(create_request(
+            MessageMethod::TOOLS_LIST,
+            Some(params),
+            Some(RequestId::Num(1)),
+            None,
+        )));
+        expect(
+            missing.is_some(),
+            format!("a request with {what} was not recognised as malformed"),
+        )?;
+    }
+
+    // And the field that is only a SHOULD stays optional.
+    let without_client_info =
+        modern::missing_required_meta(&JsonRpcMessage::Request(create_request(
+            MessageMethod::TOOLS_LIST,
+            Some(json!({"_meta": {
+                "io.modelcontextprotocol/protocolVersion": versioning::CURRENT_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+            }})),
+            Some(RequestId::Num(1)),
+            None,
+        )));
+    expect(
+        without_client_info.is_none(),
+        "clientInfo is a SHOULD, but omitting it was treated as malformed",
+    )?;
+    let _ = INVALID_PARAMS;
+    Ok(())
+}
+
+async fn removed_methods_are_gone() -> Verdict {
+    use chuk_mcp::protocol::types::errors::METHOD_NOT_FOUND;
+
+    let fixture = server::fixture();
+    for method in [MessageMethod::PING, MessageMethod::LOGGING_SET_LEVEL] {
+        // Modern: gone.
+        let modern_request = JsonRpcMessage::Request(create_request(
+            method,
+            Some(modern::params_with_version(
+                versioning::FIRST_MODERN_VERSION,
+                json!({}),
+            )),
+            Some(RequestId::Str(format!("removed-{method}"))),
+            None,
+        ));
+        let (response, _) = fixture.handle_message(modern_request, None).await;
+        let error = response
+            .as_ref()
+            .and_then(JsonRpcMessage::error)
+            .ok_or_else(|| {
+                format!("{method} was answered rather than refused in the modern era")
+            })?;
+        expect_eq(
+            &format!("{method} error code"),
+            error.code,
+            METHOD_NOT_FOUND,
+        )?;
+
+        // Legacy: still served, because the era is a property of the request.
+        let legacy_request = JsonRpcMessage::Request(create_request(
+            method,
+            Some(json!({"level": "info"})),
+            Some(RequestId::Str(format!("legacy-{method}"))),
+            None,
+        ));
+        let (response, _) = fixture.handle_message(legacy_request, None).await;
+        expect(
+            response
+                .as_ref()
+                .and_then(JsonRpcMessage::error)
+                .map(|e| e.code)
+                != Some(METHOD_NOT_FOUND),
+            format!("{method} was refused for a legacy request, which still defines it"),
+        )?;
+    }
+    Ok(())
+}
+
+async fn unsupported_version_echoes_the_request() -> Verdict {
+    let (_, _, data) = modern::unsupported_version_error(IMPOSSIBLE_VERSION);
+    let data = data.ok_or("the rejection carried no data, so there is nothing to retry from")?;
+
+    expect_eq(
+        "data.requested",
+        data.get("requested").and_then(Value::as_str),
+        Some(IMPOSSIBLE_VERSION),
+    )?;
+    expect(
+        data.get("supported")
+            .and_then(Value::as_array)
+            .is_some_and(|versions| !versions.is_empty()),
+        "data.supported was absent or empty, leaving a client nothing to renegotiate with",
+    )
 }
 
 /// Send a modern request — version declared in `_meta`, as every one must be.

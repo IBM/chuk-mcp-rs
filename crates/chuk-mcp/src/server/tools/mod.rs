@@ -36,6 +36,13 @@ struct RegisteredTool {
     /// it runs. The transport needs to know before the call starts, because it
     /// decides whether the answer can be streamed.
     interactive: bool,
+    /// Client capabilities this tool cannot run without, by their
+    /// `ClientCapabilities` field names (`"sampling"`, `"elicitation"`, …).
+    ///
+    /// Checked before the handler runs: a 2026-era server **MUST NOT** rely on
+    /// a capability the request did not declare, and finding out halfway
+    /// through a call is too late to answer cleanly.
+    requires: Vec<String>,
 }
 
 /// The tools a server offers, by name.
@@ -85,6 +92,35 @@ impl ToolRegistry {
         );
     }
 
+    /// Register an interactive tool that cannot run unless the client declared
+    /// the given capabilities.
+    ///
+    /// `requires` names `ClientCapabilities` fields — `"sampling"`,
+    /// `"elicitation"`, `"roots"`. A modern request that did not declare them
+    /// is refused with `-32021` before the handler runs.
+    pub fn insert_requiring<F, Fut>(
+        &mut self,
+        name: &str,
+        schema: Value,
+        description: &str,
+        requires: &[&str],
+        handler: F,
+    ) where
+        F: Fn(Value, CallContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Value, String>> + Send + 'static,
+    {
+        self.insert_handler(
+            name,
+            schema,
+            description,
+            true,
+            Arc::new(move |args, context| Box::pin(handler(args, context))),
+        );
+        if let Some(tool) = self.tools.get_mut(name) {
+            tool.requires = requires.iter().map(|name| name.to_string()).collect();
+        }
+    }
+
     fn insert_handler(
         &mut self,
         name: &str,
@@ -100,9 +136,23 @@ impl ToolRegistry {
                 schema,
                 description: description.to_string(),
                 interactive,
+                requires: Vec::new(),
             },
         );
         tracing::debug!("Registered tool: {name}");
+    }
+
+    /// This tool's declared `inputSchema`.
+    pub fn schema(&self, name: &str) -> Option<&Value> {
+        self.tools.get(name).map(|tool| &tool.schema)
+    }
+
+    /// The client capabilities this tool cannot run without.
+    pub fn requires(&self, name: &str) -> &[String] {
+        self.tools
+            .get(name)
+            .map(|tool| tool.requires.as_slice())
+            .unwrap_or_default()
     }
 
     /// Whether a tool by this name is registered and talks while it runs.
@@ -166,6 +216,36 @@ mod tests {
             },
         );
         registry
+    }
+
+    #[tokio::test]
+    async fn a_tool_can_declare_the_capabilities_it_needs() {
+        let mut registry = ToolRegistry::new();
+        registry.insert_requiring(
+            "needs_sampling",
+            json!({"type": "object"}),
+            "Needs the client to sample",
+            &["sampling"],
+            |_args, _context| async { Ok(json!("ran")) },
+        );
+
+        assert_eq!(
+            registry.requires("needs_sampling"),
+            &["sampling".to_string()]
+        );
+        // A tool that declared none, and a name nobody registered, both have
+        // nothing to check — and neither is an error.
+        assert!(registry.requires("greet").is_empty());
+        assert!(registry.requires("never-registered").is_empty());
+        // Such a tool talks to the client, so a transport must stream it.
+        assert!(registry.is_interactive("needs_sampling"));
+    }
+
+    #[test]
+    fn a_tool_schema_is_readable_for_header_promotion() {
+        let registry = greeting_registry();
+        assert_eq!(registry.schema("greet"), Some(&json!({"type": "object"})));
+        assert_eq!(registry.schema("never-registered"), None);
     }
 
     #[tokio::test]

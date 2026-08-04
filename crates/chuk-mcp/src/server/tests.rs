@@ -492,3 +492,301 @@ async fn a_request_without_an_id_is_not_answered() {
         assert!(response.is_none(), "{method} answered a notification");
     }
 }
+
+// ---------------------------------------------------------------------------
+// The 2026-07-28 server obligations.
+//
+// Each of these is a rule the revision added, exercised through the same
+// `handle_message` entry point a transport uses — so what is tested is what a
+// peer would actually observe.
+// ---------------------------------------------------------------------------
+
+/// Params carrying a modern `_meta` block, optionally declaring capabilities.
+fn modern_params(params: Value, capabilities: Value) -> Value {
+    let mut object = params.as_object().cloned().unwrap_or_default();
+    object.insert(
+        "_meta".to_string(),
+        json!({
+            "io.modelcontextprotocol/protocolVersion": crate::protocol::versioning::CURRENT_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": capabilities,
+        }),
+    );
+    Value::Object(object)
+}
+
+async fn modern_response(
+    server: &McpServer,
+    method: &str,
+    params: Value,
+) -> Option<JsonRpcMessage> {
+    let message = parse_message(&json!({
+        "jsonrpc": "2.0", "id": 1, "method": method, "params": params
+    }))
+    .unwrap();
+    server.handle_message(message, None).await.0
+}
+
+#[tokio::test]
+async fn cacheable_results_carry_hints_and_others_do_not() {
+    let server = server();
+
+    let listed = modern_response(
+        &server,
+        MessageMethod::TOOLS_LIST,
+        modern_params(json!({}), json!({})),
+    )
+    .await
+    .unwrap();
+    let listed = listed.result().unwrap();
+    assert!(listed["ttlMs"].is_u64());
+    assert!(matches!(
+        listed["cacheScope"].as_str(),
+        Some("public") | Some("private")
+    ));
+
+    // A tool call is an action; caching one would invite replaying it.
+    let called = modern_response(
+        &server,
+        MessageMethod::TOOLS_CALL,
+        modern_params(json!({"name": "greet", "arguments": {}}), json!({})),
+    )
+    .await
+    .unwrap();
+    assert!(called.result().unwrap().get("ttlMs").is_none());
+}
+
+#[tokio::test]
+async fn a_cache_policy_is_honoured() {
+    let server = server().with_cache_policy(CachePolicy::default().with_scope(CacheScope::Public));
+
+    let listed = modern_response(
+        &server,
+        MessageMethod::TOOLS_LIST,
+        modern_params(json!({}), json!({})),
+    )
+    .await
+    .unwrap();
+    assert_eq!(listed.result().unwrap()["cacheScope"], json!("public"));
+}
+
+#[tokio::test]
+async fn a_tool_requiring_a_capability_is_refused_without_it() {
+    use crate::protocol::types::errors::MISSING_REQUIRED_CLIENT_CAPABILITY;
+
+    let mut server = McpServer::new("test-server", "1.0.0", None);
+    server.register_tool_requiring(
+        "needs_sampling",
+        json!({"type": "object"}),
+        "Needs sampling",
+        &["sampling"],
+        |_args, _context| async { Ok(json!("ran")) },
+    );
+
+    // Declared nothing: refused before the handler runs.
+    let refused = modern_response(
+        &server,
+        MessageMethod::TOOLS_CALL,
+        modern_params(
+            json!({"name": "needs_sampling", "arguments": {}}),
+            json!({}),
+        ),
+    )
+    .await
+    .unwrap();
+    let error = refused
+        .error()
+        .expect("a protocol error, not a tool result");
+    assert_eq!(error.code, MISSING_REQUIRED_CLIENT_CAPABILITY);
+    assert_eq!(
+        error.data.as_ref().unwrap()["requiredCapabilities"],
+        json!({"sampling": {}})
+    );
+
+    // Declared it: the handler runs.
+    let served = modern_response(
+        &server,
+        MessageMethod::TOOLS_CALL,
+        modern_params(
+            json!({"name": "needs_sampling", "arguments": {}}),
+            json!({"sampling": {}}),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(served.error().is_none(), "{served:?}");
+}
+
+#[tokio::test]
+async fn a_removed_method_is_gone_for_a_modern_request_only() {
+    use crate::protocol::types::errors::METHOD_NOT_FOUND;
+    let server = server();
+
+    let modern = modern_response(
+        &server,
+        MessageMethod::PING,
+        modern_params(json!({}), json!({})),
+    )
+    .await
+    .unwrap();
+    assert_eq!(modern.error().unwrap().code, METHOD_NOT_FOUND);
+
+    // The same method over a legacy request is still defined.
+    let legacy = modern_response(&server, MessageMethod::PING, json!({}))
+        .await
+        .unwrap();
+    assert!(legacy.error().is_none(), "{legacy:?}");
+}
+
+#[tokio::test]
+async fn a_raw_prompt_may_answer_with_input_required() {
+    let mut server = McpServer::new("test-server", "1.0.0", None);
+    server.register_raw_prompt(
+        "asks_first",
+        "A prompt that needs context",
+        vec![],
+        |_arguments, context: CallContext| async move {
+            if context.input_responses().is_none() {
+                return Ok(json!({
+                    "resultType": "input_required",
+                    "inputRequests": {"ctx": {"method": "elicitation/create", "params": {}}},
+                    "requestState": "state-1",
+                }));
+            }
+            Ok(json!({"messages": []}))
+        },
+    );
+
+    let asked = modern_response(
+        &server,
+        MessageMethod::PROMPTS_GET,
+        modern_params(json!({"name": "asks_first"}), json!({})),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        asked.result().unwrap()["resultType"],
+        json!("input_required")
+    );
+
+    // Retried with the answers: it completes, and an interim result carries no
+    // caching hints.
+    let mut params = modern_params(json!({"name": "asks_first"}), json!({}));
+    params["inputResponses"] = json!({"ctx": {"action": "accept", "content": {}}});
+    params["requestState"] = json!("state-1");
+    let completed = modern_response(&server, MessageMethod::PROMPTS_GET, params)
+        .await
+        .unwrap();
+    assert_eq!(completed.result().unwrap()["resultType"], json!("complete"));
+}
+
+#[tokio::test]
+async fn a_tampered_request_state_is_refused_before_any_handler_runs() {
+    let mut server = McpServer::new("test-server", "1.0.0", None)
+        .with_request_state_validator(|state| state == "genuine");
+    server.register_tool(
+        "anything",
+        json!({"type": "object"}),
+        "Anything",
+        |_| async { Ok(json!("ran")) },
+    );
+
+    let mut params = modern_params(json!({"name": "anything", "arguments": {}}), json!({}));
+    params["requestState"] = json!("genuine-TAMPERED");
+
+    let refused = modern_response(&server, MessageMethod::TOOLS_CALL, params)
+        .await
+        .unwrap();
+    assert_eq!(refused.error().unwrap().code, INVALID_PARAMS);
+
+    // The state it did mint is accepted.
+    let mut good = modern_params(json!({"name": "anything", "arguments": {}}), json!({}));
+    good["requestState"] = json!("genuine");
+    let served = modern_response(&server, MessageMethod::TOOLS_CALL, good)
+        .await
+        .unwrap();
+    assert!(served.error().is_none(), "{served:?}");
+}
+
+#[tokio::test]
+async fn a_subscription_opens_on_a_transport_that_can_carry_one() {
+    use crate::server::listeners::NOTIFICATION_ACKNOWLEDGED;
+
+    let server = server();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+    let message = parse_message(&json!({
+        "jsonrpc": "2.0", "id": 9, "method": MessageMethod::SUBSCRIPTIONS_LISTEN,
+        "params": modern_params(json!({"notifications": {"toolsListChanged": true}}), json!({})),
+    }))
+    .unwrap();
+    let context = server.context_for(&message, sender);
+    let (response, _) = server.handle_message_with(message, None, context).await;
+
+    // No immediate response: the stream stays open.
+    assert!(response.is_none());
+
+    let acknowledgement = receiver.recv().await.expect("an acknowledgement");
+    assert_eq!(acknowledgement.method(), Some(NOTIFICATION_ACKNOWLEDGED));
+    assert_eq!(server.listeners().count(), 1);
+
+    server.listeners().tools_list_changed();
+    let notification = receiver.recv().await.expect("a notification");
+    assert_eq!(
+        notification.method(),
+        Some(MessageMethod::NOTIFICATION_TOOLS_LIST_CHANGED)
+    );
+}
+
+/// A transport with no way back cannot carry a subscription, and says so
+/// rather than opening one nobody will hear.
+#[tokio::test]
+async fn a_subscription_is_refused_where_there_is_no_stream() {
+    let server = server();
+    let refused = modern_response(
+        &server,
+        MessageMethod::SUBSCRIPTIONS_LISTEN,
+        modern_params(json!({}), json!({})),
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused.error().unwrap().code, INVALID_PARAMS);
+}
+
+#[tokio::test]
+async fn a_modern_request_logs_only_when_it_asked_to() {
+    let server = server();
+
+    // No logLevel in `_meta`: the context may emit nothing.
+    let silent = parse_message(&json!({
+        "jsonrpc": "2.0", "id": 1, "method": MessageMethod::TOOLS_CALL,
+        "params": modern_params(json!({"name": "greet", "arguments": {}}), json!({})),
+    }))
+    .unwrap();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let context = server.context_for(&silent, sender);
+    context.log("info", json!("should not be heard"));
+    assert!(
+        receiver.try_recv().is_err(),
+        "a log escaped an unasked request"
+    );
+
+    // With a level, it is heard — and below that level it is not.
+    let mut params = modern_params(json!({"name": "greet", "arguments": {}}), json!({}));
+    params["_meta"]["io.modelcontextprotocol/logLevel"] = json!("warning");
+    let asking = parse_message(&json!({
+        "jsonrpc": "2.0", "id": 1, "method": MessageMethod::TOOLS_CALL, "params": params
+    }))
+    .unwrap();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let context = server.context_for(&asking, sender);
+    context.log("debug", json!("below the floor"));
+    assert!(
+        receiver.try_recv().is_err(),
+        "a message below the floor was sent"
+    );
+    context.log("error", json!("above the floor"));
+    assert!(
+        receiver.try_recv().is_ok(),
+        "a message above the floor was dropped"
+    );
+}

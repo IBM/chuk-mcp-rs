@@ -1,6 +1,6 @@
 [package]
 name = "chuk-mcp"
-description = "Model Context Protocol (MCP) client and server library with stdio, Streamable HTTP, and SSE transports"
+description = "Model Context Protocol (MCP) client and server for the 2026-07-28 and legacy revisions, over stdio and Streamable HTTP, with OAuth 2.1 authorization"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,8 +10,15 @@ documentation = "https://docs.rs/chuk-mcp"
 readme = "README.md"
 authors = ["Chris Hay <chrishayuk@googlemail.com>"]
 rust-version = "1.79"
-keywords = ["llm", "mcp", "client", "protocol"]
+keywords = ["llm", "mcp", "client", "server", "protocol"]
 categories = ["network-programming", "api-bindings", "asynchronous"]
+
+[features]
+default = ["auth"]
+# OAuth 2.1 authorization: metadata discovery, PKCE, the authorization code
+# flow and token refresh. On by default — a server that starts requiring auth
+# should not fail against a client that merely built without a feature flag.
+auth = ["dep:sha2"]
 
 [dependencies]
 serde.workspace = true
@@ -22,6 +29,7 @@ thiserror.workspace = true
 uuid.workspace = true
 async-trait.workspace = true
 base64.workspace = true
+sha2 = { workspace = true, optional = true }
 reqwest.workspace = true
 tracing.workspace = true
 hyper.workspace = true

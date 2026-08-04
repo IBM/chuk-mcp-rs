@@ -27,6 +27,9 @@ pub struct StreamableHttpParameters {
     pub timeout: f64,
     /// Optional bearer token (added to the Authorization header).
     pub bearer_token: Option<String>,
+    /// Authorization state for this endpoint, when OAuth is in play.
+    #[cfg(feature = "auth")]
+    pub auth: Option<Arc<crate::auth::AuthSession>>,
     /// Optional session id for reconnecting to existing sessions.
     pub session_id: Option<String>,
     /// User agent string for HTTP requests.
@@ -53,6 +56,8 @@ impl StreamableHttpParameters {
             headers: HashMap::new(),
             timeout: 60.0,
             bearer_token: None,
+            #[cfg(feature = "auth")]
+            auth: None,
             session_id: None,
             user_agent: "chuk-mcp/1.0.0".to_string(),
             enable_streaming: true,
@@ -76,7 +81,18 @@ impl StreamableHttpParameters {
         if !headers.keys().any(|k| k.eq_ignore_ascii_case("user-agent")) {
             headers.insert("User-Agent".to_string(), self.user_agent.clone());
         }
-        if let Some(token) = &self.bearer_token {
+        // A token the authorization flow obtained is the current one; the
+        // configured `bearer_token` is whatever was set before any flow ran.
+        #[cfg(feature = "auth")]
+        let configured = self
+            .auth
+            .as_ref()
+            .and_then(|session| session.bearer())
+            .or_else(|| self.bearer_token.clone());
+        #[cfg(not(feature = "auth"))]
+        let configured = self.bearer_token.clone();
+
+        if let Some(token) = &configured {
             if !headers
                 .keys()
                 .any(|k| k.eq_ignore_ascii_case("authorization"))
@@ -197,6 +213,59 @@ pub(crate) async fn send_via_http(
     max_buffer_size: usize,
     hints: Option<&super::http_listen::StreamHints>,
 ) {
+    // An authorization challenge is answered and the request re-sent, rather
+    // than reported. The loop is bounded by the session's own retry budget:
+    // once that is spent, `handle_response` stops asking for a retry and the
+    // response is reported as it stands.
+    #[cfg(feature = "auth")]
+    loop {
+        match send_once_via_http(
+            client,
+            params,
+            session,
+            incoming_tx,
+            message.clone(),
+            max_buffer_size,
+            hints,
+        )
+        .await
+        {
+            Sent::Done => return,
+            Sent::Reauthorized => continue,
+        }
+    }
+    #[cfg(not(feature = "auth"))]
+    send_once_via_http(
+        client,
+        params,
+        session,
+        incoming_tx,
+        message,
+        max_buffer_size,
+        hints,
+    )
+    .await;
+}
+
+/// How one attempt ended.
+enum Sent {
+    /// The caller has its answer, or its error.
+    Done,
+    /// A token was obtained; send the request again with it.
+    #[cfg(feature = "auth")]
+    Reauthorized,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_once_via_http(
+    client: &reqwest::Client,
+    params: &StreamableHttpParameters,
+    session: &Arc<std::sync::Mutex<Option<String>>>,
+    incoming_tx: &mpsc::Sender<JsonRpcMessage>,
+    message: JsonRpcMessage,
+    max_buffer_size: usize,
+    hints: Option<&super::http_listen::StreamHints>,
+) -> Sent {
     let message_id = message.id().cloned();
     let method = message.method().unwrap_or("unknown").to_string();
     tracing::debug!("Sending HTTP message: {method} (id: {message_id:?})");
@@ -220,7 +289,7 @@ pub(crate) async fn send_via_http(
         Ok(response) => response,
         Err(e) => {
             route_error(incoming_tx, &message_id, INTERNAL_ERROR, &e.to_string()).await;
-            return;
+            return Sent::Done;
         }
     };
 
@@ -242,6 +311,34 @@ pub(crate) async fn send_via_http(
         .to_string();
 
     if status.as_u16() >= 400 {
+        #[cfg(feature = "auth")]
+        if matches!(status.as_u16(), 401 | 403) {
+            if let Some(auth) = &params.auth {
+                let challenge = response
+                    .headers()
+                    .get("WWW-Authenticate")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                match auth
+                    .handle_response(status.as_u16(), challenge.as_deref())
+                    .await
+                {
+                    Ok(crate::auth::Outcome::Retry) => return Sent::Reauthorized,
+                    Ok(crate::auth::Outcome::GiveUp) => {}
+                    Err(e) => {
+                        route_error(
+                            incoming_tx,
+                            &message_id,
+                            INTERNAL_ERROR,
+                            &format!("authorization failed: {e}"),
+                        )
+                        .await;
+                        return Sent::Done;
+                    }
+                }
+            }
+        }
+
         let text = read_body_bounded(response, max_buffer_size, "HTTP response")
             .await
             .unwrap_or_default();
@@ -252,7 +349,7 @@ pub(crate) async fn send_via_http(
             &format!("HTTP {status}: {text}"),
         )
         .await;
-        return;
+        return Sent::Done;
     }
 
     if content_type.contains("text/event-stream") {
@@ -263,14 +360,14 @@ pub(crate) async fn send_via_http(
         if let Some(hints) = hints {
             hints.record(&state);
         }
-        return;
+        return Sent::Done;
     }
 
     let text = match read_body_bounded(response, max_buffer_size, "HTTP response").await {
         Ok(text) => text,
         Err(e) => {
             route_error(incoming_tx, &message_id, INTERNAL_ERROR, &e.to_string()).await;
-            return;
+            return Sent::Done;
         }
     };
     if text.is_empty() {
@@ -283,7 +380,7 @@ pub(crate) async fn send_via_http(
                 ))
                 .await;
         }
-        return;
+        return Sent::Done;
     }
 
     // JSON (or JSON-looking) body; also tolerate SSE-formatted bodies.
@@ -305,6 +402,7 @@ pub(crate) async fn send_via_http(
             }
         }
     }
+    Sent::Done
 }
 
 /// Route a synthesized error response for a request id.

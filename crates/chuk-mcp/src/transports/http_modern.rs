@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde_json::{json, Value};
 use tokio::sync::{mpsc, Semaphore};
 
 use crate::protocol::envelope::{self, ClientIdentity, Envelope};
@@ -32,7 +33,9 @@ use crate::protocol::json_rpc::{
     create_error_response, create_notification, create_request, create_response, parse_message_str,
     JsonRpcMessage, RequestId,
 };
+use crate::protocol::messages::method::MessageMethod;
 use crate::protocol::messages::send_message::{message_channel, ReadStream, WriteStream};
+use crate::protocol::tool_schemas::ToolSchemas;
 use crate::protocol::types::errors::{
     McpError, LOCAL_MALFORMED_RESPONSE, LOCAL_REQUEST_REJECTED, LOCAL_STREAM_LOST,
     LOCAL_TRANSPORT_FAILURE,
@@ -50,6 +53,12 @@ pub struct ModernHttpParameters {
     pub headers: HashMap<String, String>,
     pub timeout: f64,
     pub bearer_token: Option<String>,
+    /// The authorization state for this endpoint, when OAuth is in play.
+    ///
+    /// Shared rather than owned: every request on this connection reads the
+    /// same token, and a `401` on one of them re-authorizes for all.
+    #[cfg(feature = "auth")]
+    pub auth: Option<Arc<crate::auth::AuthSession>>,
     pub user_agent: String,
     pub max_concurrent_requests: usize,
     /// Sent in every request's `_meta`.
@@ -76,6 +85,8 @@ impl ModernHttpParameters {
             headers: HashMap::new(),
             timeout: 60.0,
             bearer_token: None,
+            #[cfg(feature = "auth")]
+            auth: None,
             user_agent: concat!("chuk-mcp/", env!("CARGO_PKG_VERSION")).to_string(),
             max_concurrent_requests: 10,
             identity: ClientIdentity::chuk(),
@@ -117,7 +128,20 @@ impl ModernHttpParameters {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         headers.insert("User-Agent".to_string(), self.user_agent.clone());
-        if let Some(token) = &self.bearer_token {
+
+        // A token obtained by the authorization flow wins: it is the current
+        // one, while `bearer_token` is whatever the caller configured before
+        // any flow ran.
+        #[cfg(feature = "auth")]
+        let token = self
+            .auth
+            .as_ref()
+            .and_then(|session| session.bearer())
+            .or_else(|| self.bearer_token.clone());
+        #[cfg(not(feature = "auth"))]
+        let token = self.bearer_token.clone();
+
+        if let Some(token) = token {
             headers.insert("Authorization".to_string(), format!("Bearer {token}"));
         }
         headers
@@ -151,6 +175,9 @@ impl ModernHttpTransport {
 
         let semaphore = Arc::new(Semaphore::new(parameters.max_concurrent_requests.max(1)));
         let max_buffer_size = limits.max_buffer_size;
+        // Filled as `tools/list` responses go by, read when a `tools/call`
+        // needs to know which of its parameters to mirror into headers.
+        let schemas = ToolSchemas::new();
 
         let task = tokio::spawn(async move {
             while let Some(message) = outgoing_rx.recv().await {
@@ -158,6 +185,7 @@ impl ModernHttpTransport {
                 let client = client.clone();
                 let params = parameters.clone();
                 let incoming_tx = incoming_tx.clone();
+                let schemas = schemas.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     dispatch_modern(
@@ -167,6 +195,7 @@ impl ModernHttpTransport {
                         message,
                         false,
                         max_buffer_size,
+                        &schemas,
                     )
                     .await;
                 });
@@ -195,6 +224,11 @@ enum Attempt {
     /// The response identifies the peer as *not* modern. Nothing was routed to
     /// the caller, so the request can be re-sent under the legacy lifecycle.
     NotModern,
+    /// The peer demanded authorization and a token was obtained. Nothing was
+    /// routed to the caller, so the request can be sent again — this time with
+    /// a credential on it.
+    #[cfg(feature = "auth")]
+    Reauthorized,
 }
 
 /// How a dispatch ended, from a dual-era caller's point of view.
@@ -230,6 +264,7 @@ pub(crate) async fn dispatch_modern(
     message: JsonRpcMessage,
     allow_fallback: bool,
     max_buffer_size: usize,
+    schemas: &ToolSchemas,
 ) -> Dispatched {
     let caller_id = message.id().cloned();
     let Some(method) = message.method().map(str::to_string) else {
@@ -266,6 +301,33 @@ pub(crate) async fn dispatch_modern(
         }
     };
 
+    // Mirror any `x-mcp-header` parameters this tool asked for. The schema
+    // comes from a `tools/list` this connection has already seen; a tool that
+    // was never listed simply has nothing to promote, which is not an error.
+    //
+    // A schema that violates the annotation constraints costs this one call
+    // rather than the connection: `list_tools` already excludes such tools, so
+    // reaching here means the caller named it without listing it.
+    let mut envelope = envelope;
+    if envelope.method == MessageMethod::TOOLS_CALL {
+        if let Some(schema) = envelope
+            .params
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(|name| schemas.get(name))
+        {
+            let arguments = envelope
+                .params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            if let Err(e) = envelope.promote_tool_params(&schema, &arguments) {
+                tracing::warn!("not promoting parameters for this call: {e}");
+            }
+        }
+    }
+    let envelope = envelope;
+
     debug_assert!(envelope.headers_match_body());
     debug_assert!(!envelope.has_session_header());
 
@@ -279,8 +341,12 @@ pub(crate) async fn dispatch_modern(
             (Some(id), 0) => Some(id.clone()),
             (Some(_), _) => Some(RequestId::Str(uuid::Uuid::new_v4().to_string())),
         };
+        // `attempt` counts *stream* re-issues, which need a fresh id. An
+        // authorization retry does not touch it: the server never processed
+        // the request, so re-sending it under the same id is correct.
 
         let ctx = AttemptCtx {
+            schemas,
             envelope: &envelope,
             wire_id: &wire_id,
             caller_id: &caller_id,
@@ -309,6 +375,11 @@ pub(crate) async fn dispatch_modern(
                 .await;
                 return Dispatched::HandledModern;
             }
+            // Re-sent with the token the challenge provoked. The id is reused
+            // deliberately: the server refused this request before acting on
+            // it, so it is the same request, not a new one.
+            #[cfg(feature = "auth")]
+            Attempt::Reauthorized => continue,
             Attempt::Completed => return Dispatched::HandledModern,
             Attempt::Reported(Detection::Undetermined) => return Dispatched::HandledUndetermined,
             Attempt::Reported(_) => return Dispatched::HandledModern,
@@ -318,6 +389,8 @@ pub(crate) async fn dispatch_modern(
 
 /// Everything one attempt needs beyond the shared client and parameters.
 struct AttemptCtx<'a> {
+    /// Where a `tools/list` response is remembered for later promotion.
+    schemas: &'a ToolSchemas,
     envelope: &'a Envelope,
     /// The id this attempt puts on the wire — fresh on every re-issue.
     wire_id: &'a Option<RequestId>,
@@ -336,6 +409,7 @@ async fn send_once(
     ctx: &AttemptCtx<'_>,
 ) -> Attempt {
     let AttemptCtx {
+        schemas: _,
         envelope,
         wire_id,
         caller_id,
@@ -396,6 +470,34 @@ async fn send_once(
         .to_string();
 
     if status >= 400 {
+        // An authorization challenge is answered before the response is
+        // treated as a failure: the request has not been refused so much as
+        // deferred until a credential is attached.
+        #[cfg(feature = "auth")]
+        if matches!(status, 401 | 403) {
+            if let Some(session) = &params.auth {
+                let challenge = response
+                    .headers()
+                    .get("WWW-Authenticate")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                match session.handle_response(status, challenge.as_deref()).await {
+                    Ok(crate::auth::Outcome::Retry) => return Attempt::Reauthorized,
+                    Ok(crate::auth::Outcome::GiveUp) => {}
+                    Err(e) => {
+                        route_error(
+                            incoming_tx,
+                            caller_id,
+                            LOCAL_TRANSPORT_FAILURE,
+                            &format!("authorization failed: {e}"),
+                        )
+                        .await;
+                        return Attempt::Reported(Detection::Undetermined);
+                    }
+                }
+            }
+        }
+
         let text = read_body_bounded(response, max_buffer_size, "HTTP error response")
             .await
             .unwrap_or_default();
@@ -457,6 +559,9 @@ async fn send_once(
 
     match parse_message_str(&text) {
         Ok(message) => {
+            // A listing seen on the way past is what makes the *next*
+            // `tools/call` able to promote its parameters.
+            ctx.schemas.observe(&ctx.envelope.method, &message);
             let _ = incoming_tx.send(retarget(message, caller_id)).await;
             Attempt::Completed
         }

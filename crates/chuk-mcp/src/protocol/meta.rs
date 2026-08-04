@@ -143,6 +143,14 @@ pub fn subscription_id_of(params: &Value) -> Option<&str> {
     meta_of(params)?.get(SUBSCRIPTION_ID)?.as_str()
 }
 
+/// Read the log level a request asked to be served at.
+///
+/// Absent means the request wants no log notifications at all, which is a
+/// different thing from wanting them at a default level — see [`LOG_LEVEL`].
+pub fn log_level_of(params: &Value) -> Option<&str> {
+    meta_of(params)?.get(LOG_LEVEL)?.as_str()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -15,11 +15,14 @@ use pyo3::types::PyDict;
 use serde_json::{Map, Value};
 
 use chuk_mcp::protocol::json_rpc::parse_message;
+use chuk_mcp::protocol::meta::SUBSCRIPTION_ID;
 use chuk_mcp::protocol::mrtr::{
     input_required_result as build_input_required, InputRequests, RequestState,
 };
 use chuk_mcp::protocol::types::capabilities::ServerCapabilities;
 use chuk_mcp::protocol::types::info::ServerInfo;
+use chuk_mcp::server::caching::{CacheHints, CachePolicy, CacheScope};
+use chuk_mcp::server::listeners::{NotificationFilter, NOTIFICATION_ACKNOWLEDGED};
 use chuk_mcp::server::{discover, modern};
 
 use crate::{json_to_py, py_to_json, to_py_err};
@@ -172,6 +175,131 @@ fn elicit_request(
     json_to_py(py, &Value::Object(request))
 }
 
+/// Why this request's `_meta` is unusable, or `None` if it is fine.
+///
+/// A `2026-07-28` request carries its protocol version and the client's
+/// capabilities on **every** call, and a server must not infer either from an
+/// earlier request — there is no connection to infer along. A request missing
+/// them is malformed, and the answer is `-32602`.
+///
+/// `clientInfo` is deliberately not required: the specification makes it a
+/// SHOULD, and rejecting a request for omitting it would turn a recommendation
+/// into a barrier.
+#[pyfunction]
+fn missing_required_meta(message: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
+    Ok(modern::missing_required_meta(&message_of(message)?))
+}
+
+/// Whether the 2026-07-28 revision removed this method.
+///
+/// A modern server answers these `-32601`. Serving one would tell the client
+/// the stateful lifecycle is still here — and over HTTP the status is `404`.
+/// The same method over a *legacy* request is still served: the era is a
+/// property of the request, not of the server.
+#[pyfunction]
+fn is_removed_method(method: &str) -> PyResult<bool> {
+    Ok(modern::is_removed_method(method))
+}
+
+/// The methods this revision removed, for a dispatcher that wants the list.
+#[pyfunction]
+fn removed_methods() -> Vec<String> {
+    modern::REMOVED_METHODS
+        .iter()
+        .map(|method| method.to_string())
+        .collect()
+}
+
+/// Add `ttlMs` and `cacheScope` to a result, if that operation is cacheable.
+///
+/// Servers **MUST** include both on `resultType: "complete"` results from
+/// `server/discover`, `tools/list`, `prompts/list`, `resources/list`,
+/// `resources/templates/list` and `resources/read`. Anything else is returned
+/// untouched, so a dispatcher can call this on every result without deciding
+/// which ones qualify.
+///
+/// `scope` defaults to `"private"`, which is the answer that cannot leak: a
+/// `"public"` result may be served by a shared gateway to a different caller,
+/// and only the server knows whether that is safe.
+#[pyfunction]
+#[pyo3(signature = (result, method, ttl_ms=None, scope=None))]
+fn stamp_cache_hints(
+    py: Python<'_>,
+    result: &Bound<'_, PyAny>,
+    method: &str,
+    ttl_ms: Option<u64>,
+    scope: Option<&str>,
+) -> PyResult<Py<PyAny>> {
+    let scope = match scope {
+        Some(named) => CacheScope::parse(named).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "cacheScope must be \"public\" or \"private\", got {named:?}"
+            ))
+        })?,
+        None => CacheScope::Private,
+    };
+
+    let mut policy = CachePolicy::default().with_scope(scope);
+    if let Some(ttl_ms) = ttl_ms {
+        let hints = CacheHints::new(ttl_ms, scope);
+        policy = CachePolicy {
+            discover: hints,
+            tools_list: hints,
+            prompts_list: hints,
+            resources_list: hints,
+            resources_templates_list: hints,
+            resources_read: hints,
+        };
+    }
+
+    let mut value = py_to_json(result)?;
+    policy.stamp(method, &mut value);
+    json_to_py(py, &value)
+}
+
+/// Read a `subscriptions/listen` request's notification filter.
+///
+/// Returns the subset the server has agreed to honour, as the acknowledgement
+/// states it: a type the client did not ask for is absent rather than present
+/// and false, because the acknowledgement says what the client *will* get.
+#[pyfunction]
+fn subscription_filter(py: Python<'_>, params: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    let filter = NotificationFilter::from_params(&py_to_json(params)?);
+    json_to_py(py, &filter.to_acknowledgement())
+}
+
+/// The acknowledgement that must be a subscription stream's first message.
+///
+/// `subscription_id` is the JSON-RPC id of the `subscriptions/listen` request,
+/// which every message on that stream then carries in `_meta`. On stdio all
+/// subscriptions share one channel, so without the tag a client with two open
+/// could not tell them apart.
+#[pyfunction]
+fn subscription_acknowledgement(
+    py: Python<'_>,
+    subscription_id: &Bound<'_, PyAny>,
+    params: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let filter = NotificationFilter::from_params(&py_to_json(params)?);
+
+    let mut meta = Map::new();
+    meta.insert(SUBSCRIPTION_ID.to_string(), py_to_json(subscription_id)?);
+
+    let mut ack_params = Map::new();
+    ack_params.insert("notifications".to_string(), filter.to_acknowledgement());
+    ack_params.insert("_meta".to_string(), Value::Object(meta));
+
+    let mut notification = Map::new();
+    notification.insert("jsonrpc".to_string(), Value::String("2.0".to_string()));
+    notification.insert(
+        "method".to_string(),
+        Value::String(NOTIFICATION_ACKNOWLEDGED.to_string()),
+    );
+    notification.insert("params".to_string(), Value::Object(ack_params));
+
+    json_to_py(py, &Value::Object(notification))
+}
+
 /// Register the server-side protocol helpers on the module.
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(discover_result, m)?)?;
@@ -181,5 +309,11 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(stamp_result_type, m)?)?;
     m.add_function(wrap_pyfunction!(input_required_result, m)?)?;
     m.add_function(wrap_pyfunction!(elicit_request, m)?)?;
+    m.add_function(wrap_pyfunction!(missing_required_meta, m)?)?;
+    m.add_function(wrap_pyfunction!(is_removed_method, m)?)?;
+    m.add_function(wrap_pyfunction!(removed_methods, m)?)?;
+    m.add_function(wrap_pyfunction!(stamp_cache_hints, m)?)?;
+    m.add_function(wrap_pyfunction!(subscription_filter, m)?)?;
+    m.add_function(wrap_pyfunction!(subscription_acknowledgement, m)?)?;
     Ok(())
 }

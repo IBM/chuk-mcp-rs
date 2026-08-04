@@ -14,6 +14,7 @@ use serde_json::{json, Map, Value};
 
 use crate::protocol::messages::prompts::{Prompt, PromptArgument, PromptMessage};
 use crate::protocol::types::errors::INVALID_PARAMS;
+use crate::server::context::CallContext;
 
 /// Field names of the two results this module produces.
 const FIELD_PROMPTS: &str = "prompts";
@@ -32,10 +33,33 @@ pub type PromptHandler = Arc<
         + Sync,
 >;
 
+/// An async prompt handler that builds the whole result.
+///
+/// The 2026-07-28 revision lets `prompts/get` answer with an `input_required`
+/// result — a prompt may need to ask something before it can be rendered —
+/// and that is not a list of messages, so a handler that might do it returns
+/// the result itself. See [`crate::protocol::mrtr`].
+pub type RawPromptHandler = Arc<
+    dyn Fn(
+            Map<String, Value>,
+            CallContext,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// How a registered prompt produces its answer.
+pub(crate) enum Renderer {
+    /// Messages, which this module wraps into a result.
+    Messages(PromptHandler),
+    /// A whole result, which the handler has already shaped.
+    Raw(RawPromptHandler),
+}
+
 /// A prompt as registered, ready to be listed or rendered.
 pub(crate) struct RegisteredPrompt {
     pub definition: Prompt,
-    pub handler: PromptHandler,
+    pub renderer: Renderer,
 }
 
 /// The prompts a server offers, ordered by name so `prompts/list` is
@@ -127,10 +151,42 @@ pub(crate) fn register<F, Fut>(
                 arguments: (!arguments.is_empty()).then_some(arguments),
                 extra: Map::new(),
             },
-            handler: Arc::new(move |args| {
+            renderer: Renderer::Messages(Arc::new(move |args| {
                 let handler = handler.clone();
                 Box::pin(async move { handler(args).await })
-            }),
+            })),
+        },
+    );
+    tracing::debug!("Registered prompt: {name}");
+}
+
+/// Add a prompt whose handler shapes its own result.
+///
+/// For a prompt that may answer with `input_required` rather than messages.
+pub(crate) fn register_raw<F, Fut>(
+    prompts: &mut PromptRegistry,
+    name: &str,
+    description: &str,
+    arguments: Vec<PromptArgument>,
+    handler: F,
+) where
+    F: Fn(Map<String, Value>, CallContext) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Value, String>> + Send + 'static,
+{
+    let handler = Arc::new(handler);
+    prompts.insert(
+        name.to_string(),
+        RegisteredPrompt {
+            definition: Prompt {
+                name: name.to_string(),
+                description: Some(description.to_string()),
+                arguments: (!arguments.is_empty()).then_some(arguments),
+                extra: Map::new(),
+            },
+            renderer: Renderer::Raw(Arc::new(move |args, context| {
+                let handler = handler.clone();
+                Box::pin(async move { handler(args, context).await })
+            })),
         },
     );
     tracing::debug!("Registered prompt: {name}");
@@ -153,6 +209,7 @@ pub(crate) async fn get_result(
     prompts: &PromptRegistry,
     name: &str,
     arguments: Map<String, Value>,
+    context: &CallContext,
 ) -> Result<Value, (i64, String)> {
     let prompt = prompts
         .get(name)
@@ -178,7 +235,19 @@ pub(crate) async fn get_result(
         }
     }
 
-    let messages = (prompt.handler)(arguments)
+    let handler = match &prompt.renderer {
+        // A handler that shapes its own result is taken at its word: wrapping
+        // an `input_required` in `messages` would turn a question into an
+        // answer that says nothing.
+        Renderer::Raw(handler) => {
+            return handler(arguments, context.clone())
+                .await
+                .map_err(|error| (INVALID_PARAMS, error))
+        }
+        Renderer::Messages(handler) => handler,
+    };
+
+    let messages = handler(arguments)
         .await
         .map_err(|error| (INVALID_PARAMS, error))?;
 
@@ -211,7 +280,7 @@ mod tests {
                     ]),
                     extra: Map::new(),
                 },
-                handler: Arc::new(|arguments| {
+                renderer: Renderer::Messages(Arc::new(|arguments| {
                     Box::pin(async move {
                         let topic = arguments
                             .get("topic")
@@ -220,7 +289,7 @@ mod tests {
                             .to_string();
                         Ok(vec![text_message("user", format!("Summarise {topic}"))])
                     })
-                }),
+                })),
             },
         );
         prompts
@@ -246,9 +315,14 @@ mod tests {
 
     #[tokio::test]
     async fn getting_a_prompt_renders_its_messages() {
-        let result = get_result(&registry(), "summarise", arguments(&[("topic", "otters")]))
-            .await
-            .expect("the prompt renders");
+        let result = get_result(
+            &registry(),
+            "summarise",
+            arguments(&[("topic", "otters")]),
+            &CallContext::detached(),
+        )
+        .await
+        .expect("the prompt renders");
 
         assert_eq!(result[FIELD_DESCRIPTION], json!("Summarise a topic"));
         let messages = result[FIELD_MESSAGES].as_array().expect("messages");
@@ -261,9 +335,14 @@ mod tests {
     async fn a_missing_required_argument_is_reported_by_name() {
         // Named, because "invalid params" alone leaves the caller guessing
         // which one.
-        let (code, message) = get_result(&registry(), "summarise", Map::new())
-            .await
-            .expect_err("must be rejected");
+        let (code, message) = get_result(
+            &registry(),
+            "summarise",
+            Map::new(),
+            &CallContext::detached(),
+        )
+        .await
+        .expect_err("must be rejected");
 
         assert_eq!(code, INVALID_PARAMS);
         assert!(message.contains("topic"), "unhelpful message: {message}");
@@ -271,16 +350,19 @@ mod tests {
 
     #[tokio::test]
     async fn an_optional_argument_may_be_omitted() {
-        assert!(
-            get_result(&registry(), "summarise", arguments(&[("topic", "otters")]))
-                .await
-                .is_ok()
-        );
+        assert!(get_result(
+            &registry(),
+            "summarise",
+            arguments(&[("topic", "otters")]),
+            &CallContext::detached(),
+        )
+        .await
+        .is_ok());
     }
 
     #[tokio::test]
     async fn an_unknown_prompt_is_an_error_naming_it() {
-        let (code, message) = get_result(&registry(), "nope", Map::new())
+        let (code, message) = get_result(&registry(), "nope", Map::new(), &CallContext::detached())
             .await
             .expect_err("must be rejected");
         assert_eq!(code, INVALID_PARAMS);
@@ -299,11 +381,13 @@ mod tests {
                     arguments: None,
                     extra: Map::new(),
                 },
-                handler: Arc::new(|_| Box::pin(async { Err("the corpus is offline".to_string()) })),
+                renderer: Renderer::Messages(Arc::new(|_| {
+                    Box::pin(async { Err("the corpus is offline".to_string()) })
+                })),
             },
         );
 
-        let (_code, message) = get_result(&prompts, "broken", Map::new())
+        let (_code, message) = get_result(&prompts, "broken", Map::new(), &CallContext::detached())
             .await
             .expect_err("must surface the handler's failure");
         assert!(message.contains("corpus is offline"));
@@ -335,7 +419,7 @@ mod tests {
 
         let mut arguments = Map::new();
         arguments.insert("who".to_string(), json!("Ada"));
-        let rendered = get_result(&prompts, "greet", arguments)
+        let rendered = get_result(&prompts, "greet", arguments, &CallContext::detached())
             .await
             .expect("a prompt that renders");
         assert_eq!(

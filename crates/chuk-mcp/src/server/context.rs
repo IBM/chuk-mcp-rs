@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 use crate::protocol::json_rpc::{create_notification, create_request, JsonRpcMessage};
 use crate::protocol::messages::method::MessageMethod;
 
+use super::logging::LogLevel;
 use super::pending::PendingRequests;
 
 /// How long a server request waits for the client before giving up.
@@ -39,6 +40,29 @@ pub struct CallContext {
     pending: Arc<PendingRequests>,
     progress_token: Option<Value>,
     timeout: Duration,
+    /// The least severe log message this call may emit, or `None` for a call
+    /// that may emit none at all.
+    ///
+    /// The 2026-07-28 revision removed `logging/setLevel` and put the level on
+    /// the request instead, so a server **MUST NOT** emit
+    /// `notifications/message` for a request whose `_meta` omitted
+    /// `io.modelcontextprotocol/logLevel`. `None` is that case: silence is the
+    /// default, and asking is what turns logging on.
+    log_floor: Option<LogLevel>,
+    /// What a multi round-trip retry brought back, and the state it echoed.
+    ///
+    /// Both live beside `arguments` in the request params rather than inside
+    /// them, so a handler cannot reach them through its arguments and needs
+    /// them from here. See [`crate::protocol::mrtr`].
+    round_trip: RoundTrip,
+}
+
+/// The multi round-trip fields a request carried, and who is asking.
+#[derive(Clone, Debug, Default)]
+struct RoundTrip {
+    input_responses: Option<Value>,
+    request_state: Option<String>,
+    client_capabilities: Vec<String>,
 }
 
 impl CallContext {
@@ -54,6 +78,36 @@ impl CallContext {
             pending,
             progress_token,
             timeout,
+            // Permissive by default, which is what a directly-constructed
+            // context and the legacy era both want. The server narrows it per
+            // request in `McpServer::context_for`.
+            log_floor: Some(LogLevel::Debug),
+            round_trip: RoundTrip::default(),
+        }
+    }
+
+    /// Set the least severe message this call may log.
+    ///
+    /// `None` silences logging entirely — the correct setting for a modern
+    /// request that did not ask for it.
+    pub fn with_log_floor(mut self, floor: Option<LogLevel>) -> Self {
+        self.log_floor = floor;
+        self
+    }
+
+    /// Whether a message at `level` may be sent on this call.
+    ///
+    /// An unparseable level is not silently dropped: a handler that logs at
+    /// `"warn"` rather than `"warning"` should still be heard, and guessing
+    /// that it meant nothing would lose the message.
+    fn may_log(&self, level: &str) -> bool {
+        let Some(floor) = self.log_floor else {
+            return false;
+        };
+        match LogLevel::parse(level) {
+            Some(level) => level >= floor,
+            // An unrecognised level is still a message somebody meant to send.
+            None => true,
         }
     }
 
@@ -69,6 +123,8 @@ impl CallContext {
             pending: Arc::new(PendingRequests::new()),
             progress_token: None,
             timeout: DEFAULT_CLIENT_TIMEOUT,
+            log_floor: Some(LogLevel::Debug),
+            round_trip: RoundTrip::default(),
         }
     }
 
@@ -77,12 +133,75 @@ impl CallContext {
         self.outbound.is_some()
     }
 
+    /// The channel back to the client, for a caller that needs to keep sending
+    /// after this call returns.
+    ///
+    /// `subscriptions/listen` is the one such caller: its stream outlives the
+    /// request that opened it, so the subscription registry holds a clone of
+    /// this sender and the stream stays open for as long as it does.
+    pub(crate) fn outbound(&self) -> Option<&mpsc::UnboundedSender<JsonRpcMessage>> {
+        self.outbound.as_ref()
+    }
+
     /// The token the caller asked progress to be reported under, if any.
     ///
     /// Progress is only reported when the client asked for it, so a handler
     /// that wants to skip the work of measuring can check first.
     pub fn progress_token(&self) -> Option<&Value> {
         self.progress_token.as_ref()
+    }
+
+    /// Carry the multi round-trip fields of the request being handled.
+    pub(crate) fn with_round_trip(
+        mut self,
+        input_responses: Option<Value>,
+        request_state: Option<String>,
+        client_capabilities: Vec<String>,
+    ) -> Self {
+        self.round_trip = RoundTrip {
+            input_responses,
+            request_state,
+            client_capabilities,
+        };
+        self
+    }
+
+    /// The answers a client attached when retrying this request.
+    ///
+    /// `None` on the first attempt — which is exactly the signal a handler
+    /// uses to decide whether to ask for input or to finish.
+    pub fn input_responses(&self) -> Option<&Value> {
+        self.round_trip.input_responses.as_ref()
+    }
+
+    /// The answer a client gave to one input request, by its key.
+    pub fn input_response(&self, key: &str) -> Option<&Value> {
+        self.round_trip.input_responses.as_ref()?.get(key)
+    }
+
+    /// The opaque state this server sent with its last `input_required`, as the
+    /// client echoed it back.
+    ///
+    /// Opaque to the *client*, not to the server that minted it: verifying it
+    /// is what stops a client editing the state a server is relying on.
+    pub fn request_state(&self) -> Option<&str> {
+        self.round_trip.request_state.as_deref()
+    }
+
+    /// The capabilities this request declared, by name.
+    ///
+    /// A server **MUST NOT** ask for input by a method the client cannot
+    /// answer, so a handler building `inputRequests` consults this first.
+    pub fn client_capabilities(&self) -> &[String] {
+        &self.round_trip.client_capabilities
+    }
+
+    /// Whether the request declared a named client capability.
+    pub fn client_supports(&self, capability: &str) -> bool {
+        self.round_trip
+            .client_capabilities
+            .iter()
+            .any(|declared| declared == capability)
     }
 
     /// Send a notification to the client. Nothing is expected back.
@@ -113,7 +232,16 @@ impl CallContext {
     }
 
     /// Send a log message to the client.
+    ///
+    /// Dropped when this call may not log — see [`with_log_floor`]. A handler
+    /// does not need to check first: logging where nobody asked for it is a
+    /// no-op rather than an error.
+    ///
+    /// [`with_log_floor`]: Self::with_log_floor
     pub fn log(&self, level: &str, data: Value) {
+        if !self.may_log(level) {
+            return;
+        }
         self.notify(
             MessageMethod::NOTIFICATION_MESSAGE,
             json!({FIELD_LEVEL: level, FIELD_DATA: data}),
@@ -122,6 +250,9 @@ impl CallContext {
 
     /// Send a log message attributed to a named logger.
     pub fn log_from(&self, level: &str, logger: &str, data: Value) {
+        if !self.may_log(level) {
+            return;
+        }
         self.notify(
             MessageMethod::NOTIFICATION_MESSAGE,
             json!({FIELD_LEVEL: level, FIELD_LOGGER: logger, FIELD_DATA: data}),

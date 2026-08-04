@@ -42,6 +42,14 @@ jobs:
         env:
           PYO3_PYTHON: python3
 
+      # The `auth` feature is on by default, so nothing above would notice it
+      # breaking when switched off — and a caller who wants a lean build is
+      # exactly the one who finds out the hard way.
+      - name: Build and test without default features
+        run: |
+          cargo clippy -p chuk-mcp --no-default-features --all-targets -- -D warnings
+          cargo test -p chuk-mcp --no-default-features
+
       # Benchmarks are not run in CI — the numbers would be noise on a shared
       # runner — but they are compiled, so a change to the core crate cannot
       # silently break them.

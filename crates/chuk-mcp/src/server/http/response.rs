@@ -33,15 +33,63 @@ fn full(payload: impl Into<Bytes>) -> Body {
 }
 
 /// A JSON-RPC response, as `application/json`.
-pub(crate) fn json(message: &JsonRpcMessage, session: Option<&str>) -> Response<Body> {
+///
+/// `modern` says whether the request was a 2026-era one, because the statuses
+/// below are that revision's rules. Applying them to a legacy exchange would
+/// change answers that revision defined as `200`.
+pub(crate) fn json(
+    message: &JsonRpcMessage,
+    session: Option<&str>,
+    modern: bool,
+) -> Response<Body> {
+    json_with_status(message, session, status_for(message, modern))
+}
+
+/// A JSON-RPC response with an explicit status.
+pub(crate) fn json_with_status(
+    message: &JsonRpcMessage,
+    session: Option<&str>,
+    code: StatusCode,
+) -> Response<Body> {
     with_session(
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, JSON),
+        Response::builder().status(code).header(CONTENT_TYPE, JSON),
         session,
     )
     .body(full(message.to_json()))
     .expect("a response with a valid status and headers")
+}
+
+/// The HTTP status an answer should carry.
+///
+/// The 2026-07-28 revision ties three JSON-RPC errors to a transport status, so
+/// an intermediary can act on them without parsing the body: a request that
+/// misdescribes itself or names an unspeakable version is a `400`, and a method
+/// the server does not implement — including the ones this revision removed —
+/// is a `404`.
+///
+/// Deliberately narrow beyond those. `-32602` is *not* here: "unknown tool" and
+/// "unknown resource" use it too, and those are answers to a well-formed
+/// request rather than a malformed one. The envelope checks that do warrant a
+/// `400` set their status explicitly, before dispatch.
+fn status_for(message: &JsonRpcMessage, modern: bool) -> StatusCode {
+    use crate::protocol::types::errors::{
+        HEADER_MISMATCH, METHOD_NOT_FOUND, MISSING_REQUIRED_CLIENT_CAPABILITY,
+        UNSUPPORTED_PROTOCOL_VERSION,
+    };
+
+    if !modern {
+        return StatusCode::OK;
+    }
+    match message {
+        JsonRpcMessage::Error(error) => match error.error.code {
+            HEADER_MISMATCH | UNSUPPORTED_PROTOCOL_VERSION | MISSING_REQUIRED_CLIENT_CAPABILITY => {
+                StatusCode::BAD_REQUEST
+            }
+            METHOD_NOT_FOUND => StatusCode::NOT_FOUND,
+            _ => StatusCode::OK,
+        },
+        _ => StatusCode::OK,
+    }
 }
 
 /// An event stream fed by `messages`, ending when the sender is dropped.
@@ -127,20 +175,20 @@ mod tests {
 
     #[test]
     fn a_json_response_carries_the_session_only_when_there_is_one() {
-        let with = json(&response_message(), Some("session-1"));
+        let with = json(&response_message(), Some("session-1"), true);
         assert_eq!(with.status(), StatusCode::OK);
         assert_eq!(with.headers()[CONTENT_TYPE], JSON);
         assert_eq!(with.headers()[SESSION_HEADER], "session-1");
 
         // A modern exchange has no session, and inventing a header would
         // invite the client to start sending one back.
-        let without = json(&response_message(), None);
+        let without = json(&response_message(), None, true);
         assert!(without.headers().get(SESSION_HEADER).is_none());
     }
 
     #[test]
     fn a_session_that_cannot_be_a_header_is_dropped_rather_than_panicking() {
-        let response = json(&response_message(), Some("bad\nvalue"));
+        let response = json(&response_message(), Some("bad\nvalue"), true);
         assert_eq!(response.status(), StatusCode::OK);
         assert!(response.headers().get(SESSION_HEADER).is_none());
     }
@@ -166,7 +214,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_json_body_carries_the_message_it_was_given() {
-        let body = read(json(&response_message(), None)).await;
+        let body = read(json(&response_message(), None, true)).await;
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("JSON");
         assert_eq!(parsed["result"]["ok"], json!(true));
     }

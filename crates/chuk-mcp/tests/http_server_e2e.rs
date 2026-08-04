@@ -292,3 +292,118 @@ async fn serve_http_binds_and_serves_on_its_own() {
         .expect("connect to a server that bound itself");
     assert_eq!(client.era(), Some(ProtocolEra::Modern));
 }
+
+/// A `2026-07-28` request whose headers misdescribe it must be refused before
+/// it is dispatched, with the status an intermediary can act on.
+#[tokio::test]
+async fn a_request_whose_headers_disagree_with_its_body_is_refused() {
+    let (base, _origin) = spawn_raw().await;
+    let client = reqwest::Client::new();
+
+    let body = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/list",
+        "params": {"_meta": {
+            "io.modelcontextprotocol/protocolVersion": versioning::CURRENT_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": {},
+        }},
+    });
+
+    // Mcp-Method names a different method than the body.
+    let mismatched = client
+        .post(format!("{base}/mcp"))
+        .header("MCP-Protocol-Version", versioning::CURRENT_VERSION)
+        .header("Mcp-Method", "tools/call")
+        .json(&body)
+        .send()
+        .await
+        .expect("a response");
+    assert_eq!(mismatched.status(), 400);
+    let error: serde_json::Value = mismatched.json().await.expect("a JSON-RPC error");
+    assert_eq!(error["error"]["code"], json!(-32020));
+
+    // And a modern request missing the `_meta` it must carry.
+    let bare = client
+        .post(format!("{base}/mcp"))
+        .header("MCP-Protocol-Version", versioning::CURRENT_VERSION)
+        .header("Mcp-Method", "tools/list")
+        .json(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}))
+        .send()
+        .await
+        .expect("a response");
+    assert_eq!(bare.status(), 400);
+    let error: serde_json::Value = bare.json().await.expect("a JSON-RPC error");
+    assert_eq!(error["error"]["code"], json!(-32602));
+}
+
+/// A method this revision removed is a `404`, so an intermediary sees it
+/// without parsing the body — and a legacy request still gets it.
+#[tokio::test]
+async fn a_removed_method_is_a_404_for_a_modern_request() {
+    let (base, _origin) = spawn_raw().await;
+    let client = reqwest::Client::new();
+
+    let modern = client
+        .post(format!("{base}/mcp"))
+        .header("MCP-Protocol-Version", versioning::CURRENT_VERSION)
+        .header("Mcp-Method", "ping")
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "ping",
+            "params": {"_meta": {
+                "io.modelcontextprotocol/protocolVersion": versioning::CURRENT_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+            }},
+        }))
+        .send()
+        .await
+        .expect("a response");
+    assert_eq!(modern.status(), 404);
+
+    let legacy = client
+        .post(format!("{base}/mcp"))
+        .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}))
+        .send()
+        .await
+        .expect("a response");
+    assert_eq!(legacy.status(), 200);
+}
+
+/// A notification that misdescribes itself has no id to answer against, so the
+/// status is the whole of the reply.
+#[tokio::test]
+async fn a_misdescribed_notification_is_refused_with_a_status_alone() {
+    let (base, _origin) = spawn_raw().await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/mcp"))
+        .header("MCP-Protocol-Version", versioning::CURRENT_VERSION)
+        .header("Mcp-Method", "notifications/progress")
+        .json(&json!({"jsonrpc": "2.0", "method": "notifications/cancelled"}))
+        .send()
+        .await
+        .expect("a response");
+
+    assert_eq!(response.status(), 400);
+    assert!(response
+        .text()
+        .await
+        .unwrap_or_default()
+        .contains("Mcp-Method"));
+}
+
+/// A body larger than the server will read is refused rather than buffered.
+#[tokio::test]
+async fn an_oversized_body_is_refused() {
+    let (base, _origin) = spawn_raw().await;
+
+    // Comfortably past the 10 MiB ceiling.
+    let huge = "x".repeat(11 * 1024 * 1024);
+    let response = reqwest::Client::new()
+        .post(format!("{base}/mcp"))
+        .header("Content-Type", "application/json")
+        .body(huge)
+        .send()
+        .await
+        .expect("a response");
+
+    assert_eq!(response.status(), 400);
+}

@@ -41,9 +41,11 @@ use crate::protocol::envelope::ClientIdentity;
 use crate::protocol::era::{EndpointKey, EraCache, EraMode, ProtocolEra};
 use crate::protocol::json_rpc::JsonRpcMessage;
 use crate::protocol::messages::send_message::{message_channel, ReadStream, WriteStream};
+use crate::protocol::tool_schemas::ToolSchemas;
 use crate::protocol::types::errors::McpError;
 use crate::protocol::versioning;
 use crate::transports::http::{self, StreamableHttpParameters};
+use crate::transports::http_listen;
 use crate::transports::http_modern::{self, Dispatched, ModernHttpParameters};
 use crate::transports::limits::TransportLimits;
 use crate::transports::Transport;
@@ -55,6 +57,9 @@ pub struct DualEraHttpParameters {
     pub headers: HashMap<String, String>,
     pub timeout: f64,
     pub bearer_token: Option<String>,
+    /// Authorization state for this endpoint, when OAuth is in play.
+    #[cfg(feature = "auth")]
+    pub auth: Option<Arc<crate::auth::AuthSession>>,
     pub max_concurrent_requests: usize,
     pub identity: ClientIdentity,
     /// `Auto` detects; `Legacy` and `Modern` pin and never probe.
@@ -75,6 +80,8 @@ impl DualEraHttpParameters {
             headers: HashMap::new(),
             timeout: modern.timeout,
             bearer_token: None,
+            #[cfg(feature = "auth")]
+            auth: None,
             max_concurrent_requests: modern.max_concurrent_requests,
             identity: ClientIdentity::chuk(),
             mode: EraMode::Auto,
@@ -116,6 +123,10 @@ impl DualEraHttpParameters {
         params.headers = self.headers.clone();
         params.timeout = self.timeout;
         params.bearer_token = self.bearer_token.clone();
+        #[cfg(feature = "auth")]
+        {
+            params.auth = self.auth.clone();
+        }
         params.max_concurrent_requests = self.max_concurrent_requests;
         params.identity = self.identity.clone();
         params.protocol_version = versioning::FIRST_MODERN_VERSION.to_string();
@@ -128,8 +139,46 @@ impl DualEraHttpParameters {
         params.headers = self.headers.clone();
         params.timeout = self.timeout;
         params.bearer_token = self.bearer_token.clone();
+        #[cfg(feature = "auth")]
+        {
+            params.auth = self.auth.clone();
+        }
         params.max_concurrent_requests = self.max_concurrent_requests;
         params
+    }
+}
+
+/// Everything opening the legacy `GET` stream needs.
+///
+/// Held so the stream can be opened from either direction: lazily, by the
+/// first legacy request, or eagerly, the moment a caller tells the transport
+/// the peer is legacy.
+#[derive(Clone)]
+pub(crate) struct LegacyStream {
+    client: reqwest::Client,
+    parameters: DualEraHttpParameters,
+    session: Arc<std::sync::Mutex<Option<String>>>,
+    incoming_tx: mpsc::Sender<JsonRpcMessage>,
+    max_buffer_size: usize,
+    listener: Arc<LegacyListener>,
+}
+
+impl LegacyStream {
+    /// Open the stream if it is not already open, and hand back the hints a
+    /// request should carry.
+    /// Wait for the stream to settle, if one has been opened.
+    async fn wait_ready(&self) {
+        self.listener.ready.wait().await;
+    }
+
+    fn ensure(&self) -> Arc<http_listen::StreamHints> {
+        self.listener.ensure(
+            &self.client,
+            &self.parameters,
+            &self.session,
+            &self.incoming_tx,
+            self.max_buffer_size,
+        )
     }
 }
 
@@ -139,6 +188,7 @@ pub struct DualEraHttpTransport {
     outgoing: WriteStream,
     era_cache: Arc<EraCache>,
     key: EndpointKey,
+    legacy_stream: LegacyStream,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -171,6 +221,18 @@ impl DualEraHttpTransport {
         let max_buffer_size = limits.max_buffer_size;
         let cache_for_task = era_cache.clone();
         let key_for_task = key.clone();
+        // Shared across every request on this connection: a `tools/list` seen
+        // once is what lets a later `tools/call` promote its parameters.
+        let schemas = ToolSchemas::new();
+        let legacy_stream = LegacyStream {
+            client: client.clone(),
+            parameters: parameters.clone(),
+            session: legacy_session.clone(),
+            incoming_tx: incoming_tx.clone(),
+            max_buffer_size,
+            listener: Arc::new(LegacyListener::default()),
+        };
+        let stream_for_task = legacy_stream.clone();
 
         let task = tokio::spawn(async move {
             while let Some(message) = outgoing_rx.recv().await {
@@ -181,6 +243,8 @@ impl DualEraHttpTransport {
                 let cache = cache_for_task.clone();
                 let key = key_for_task.clone();
                 let session = legacy_session.clone();
+                let schemas = schemas.clone();
+                let legacy_stream = stream_for_task.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     route(
@@ -192,6 +256,8 @@ impl DualEraHttpTransport {
                         &incoming_tx,
                         message,
                         max_buffer_size,
+                        &schemas,
+                        &legacy_stream,
                     )
                     .await;
                 });
@@ -203,6 +269,7 @@ impl DualEraHttpTransport {
             outgoing,
             era_cache,
             key,
+            legacy_stream,
             task: Some(task),
         })
     }
@@ -213,6 +280,29 @@ impl DualEraHttpTransport {
     /// peer — HTTP cannot know sooner.
     pub fn era(&self) -> Option<ProtocolEra> {
         self.era_cache.get(&self.key)
+    }
+
+    /// Record which era this endpoint speaks.
+    ///
+    /// The transport works the era out per request, but a caller may learn it
+    /// first: [`crate::connect`] settles the handshake before handing the
+    /// client over, and what it discovered there has to reach the transport or
+    /// the two disagree.
+    ///
+    /// The disagreement is not academic. A legacy server that answers
+    /// `server/discover` with an ordinary `-32601` — an HTTP `200` carrying a
+    /// JSON-RPC error — completes the request as far as the modern path is
+    /// concerned, so the transport concludes "modern" while the handshake
+    /// concluded "legacy". The visible symptom is a client that never opens
+    /// the `GET` stream and so never hears a pushed `elicitation/create`.
+    pub fn set_era(&self, era: ProtocolEra) {
+        self.era_cache.insert(self.key.clone(), era);
+        if era == ProtocolEra::Legacy {
+            // Opened now rather than on the next request: a server may push
+            // before the client asks for anything else, and a stream opened
+            // after that push has already missed it.
+            self.legacy_stream.ensure();
+        }
     }
 }
 
@@ -227,6 +317,8 @@ async fn route(
     incoming_tx: &mpsc::Sender<JsonRpcMessage>,
     message: JsonRpcMessage,
     max_buffer_size: usize,
+    schemas: &ToolSchemas,
+    legacy_stream: &LegacyStream,
 ) {
     // A pinned mode ignores both the cache and detection — that is the point of
     // pinning, and why it works behind a gateway that mangles the 400 body.
@@ -240,6 +332,7 @@ async fn route(
             incoming_tx,
             message,
             max_buffer_size,
+            legacy_stream,
         )
         .await;
         return;
@@ -255,6 +348,7 @@ async fn route(
         message.clone(),
         unknown,
         max_buffer_size,
+        schemas,
     )
     .await;
 
@@ -282,9 +376,54 @@ async fn route(
                 incoming_tx,
                 message,
                 max_buffer_size,
+                legacy_stream,
             )
             .await;
         }
+    }
+}
+
+/// The legacy server-to-client stream, and whether it has been opened.
+///
+/// The 2026 revision removed the `GET` endpoint, so this transport cannot open
+/// one up front the way [`crate::transports::http`] does: until the era is
+/// known, a `GET` would be a request the peer may have no answer for. It is
+/// started instead at the first moment the peer is known to be legacy — which
+/// is before any legacy request is sent, and therefore before the server has
+/// anything to push back.
+#[derive(Default)]
+pub(crate) struct LegacyListener {
+    started: std::sync::atomic::AtomicBool,
+    hints: Arc<http_listen::StreamHints>,
+    pub(crate) ready: Arc<http_listen::Ready>,
+}
+
+impl LegacyListener {
+    /// Open the stream if it is not already open, and hand back the hints a
+    /// request should carry.
+    fn ensure(
+        &self,
+        client: &reqwest::Client,
+        params: &DualEraHttpParameters,
+        legacy_session: &Arc<std::sync::Mutex<Option<String>>>,
+        incoming_tx: &mpsc::Sender<JsonRpcMessage>,
+        max_buffer_size: usize,
+    ) -> Arc<http_listen::StreamHints> {
+        // `swap` rather than load-then-store: two requests racing to be the
+        // first legacy one must not open two streams.
+        if !self.started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            tracing::debug!("{} is legacy; opening the GET stream", params.url);
+            tokio::spawn(http_listen::listen(
+                client.clone(),
+                params.legacy(),
+                legacy_session.clone(),
+                incoming_tx.clone(),
+                max_buffer_size,
+                self.ready.clone(),
+                self.hints.clone(),
+            ));
+        }
+        self.hints.clone()
     }
 }
 
@@ -295,10 +434,14 @@ async fn send_legacy(
     incoming_tx: &mpsc::Sender<JsonRpcMessage>,
     message: JsonRpcMessage,
     max_buffer_size: usize,
+    legacy_stream: &LegacyStream,
 ) {
-    // No listener on the dual transport: the modern era has no
-    // server-to-client stream to resume, and a legacy peer reached this way is
-    // driven request-by-request.
+    // A legacy server may push `sampling/createMessage` or
+    // `elicitation/create` at any time, and it does so on the `GET` stream. A
+    // client that never opened one simply never hears them — so opening it is
+    // part of speaking the era, not an optimisation.
+    let hints = legacy_stream.ensure();
+
     http::send_via_http(
         client,
         &params.legacy(),
@@ -306,13 +449,26 @@ async fn send_legacy(
         incoming_tx,
         message,
         max_buffer_size,
-        None,
+        Some(&hints),
     )
     .await;
 }
 
 #[async_trait]
 impl Transport for DualEraHttpTransport {
+    /// Wait until a legacy peer's `GET` stream is live.
+    ///
+    /// Only meaningful once the era is known: a modern peer has no such stream
+    /// and would wait for something that is never coming. Against a legacy one
+    /// this is what stops the first request racing the stream that carries the
+    /// server's reply to it — the stream is opened as soon as the era settles,
+    /// but opening it takes a round trip the caller would otherwise outrun.
+    async fn ready(&self) {
+        if self.era() == Some(ProtocolEra::Legacy) {
+            self.legacy_stream.wait_ready().await;
+        }
+    }
+
     async fn get_streams(&self) -> Result<(ReadStream, WriteStream), McpError> {
         Ok((self.incoming.clone(), self.outgoing.clone()))
     }

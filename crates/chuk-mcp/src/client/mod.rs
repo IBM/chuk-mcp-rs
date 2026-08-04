@@ -7,6 +7,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::protocol::era::{ProtocolEra, ServerProfile};
+use crate::protocol::header_params;
 use crate::protocol::messages::initialize::{
     send_initialize_with_options, InitializeOptions, InitializeResult,
 };
@@ -183,9 +184,35 @@ impl McpClient {
     }
 
     /// List available tools.
+    ///
+    /// A tool whose `x-mcp-header` annotations violate the constraints in
+    /// [`header_params`] is **excluded** rather than returned. The
+    /// specification requires it: an annotation naming a header with a CR/LF
+    /// in it, or two annotations colliding case-insensitively, is a tool
+    /// definition that cannot be turned into headers safely — and a client
+    /// that called it anyway would be the thing doing the damage.
+    ///
+    /// One bad definition costs its own tool and nothing else. Failing the
+    /// whole listing would let a single malformed tool deny the user every
+    /// other one, which the specification rules out explicitly.
+    ///
+    /// [`header_params`]: crate::protocol::header_params
     pub async fn list_tools(&self) -> Result<Vec<Tool>, McpError> {
         let (read, write) = self.streams()?;
-        Ok(send_tools_list(read, write, None).await?.tools)
+        let listed = send_tools_list(read, write, None).await?.tools;
+        Ok(listed
+            .into_iter()
+            .filter(|tool| match header_params::collect(&tool.input_schema) {
+                Ok(_) => true,
+                Err(reason) => {
+                    // Logged with the name and the reason: a tool silently
+                    // absent from a listing is near-impossible to diagnose
+                    // from the outside.
+                    tracing::warn!("excluding tool {:?} from tools/list: {reason}", tool.name);
+                    false
+                }
+            })
+            .collect())
     }
 
     /// Call a tool with JSON object arguments.

@@ -5,11 +5,13 @@
 //! module is the switchboard, and everything it knows about a feature is
 //! confined to the module that owns it.
 
+pub mod caching;
 pub mod completion;
 pub mod context;
 pub mod discover;
 pub mod dispatch;
 pub mod http;
+pub mod listeners;
 pub mod logging;
 pub mod modern;
 pub mod pending;
@@ -32,8 +34,10 @@ use crate::protocol::messages::method::MessageMethod;
 use crate::protocol::types::capabilities::ServerCapabilities;
 use crate::protocol::types::info::ServerInfo;
 
+pub use caching::{CacheHints, CachePolicy, CacheScope};
 pub use completion::{CompletionHandler, CompletionRequest};
 pub use context::CallContext;
+pub use listeners::{Listeners, NotificationFilter};
 pub use logging::LogLevel;
 pub use pending::PendingRequests;
 pub use protocol_handler::{method_handler, params_object, HandlerResult, ProtocolHandler};
@@ -48,6 +52,10 @@ const FIELD_URI: &str = "uri";
 const FIELD_LEVEL: &str = "level";
 const FIELD_META: &str = "_meta";
 const FIELD_PROGRESS_TOKEN: &str = "progressToken";
+/// Multi round-trip fields, which sit beside `arguments` rather than inside
+/// them — see [`crate::protocol::mrtr`].
+const FIELD_INPUT_RESPONSES: &str = "inputResponses";
+const FIELD_REQUEST_STATE: &str = "requestState";
 
 /// High-level MCP server: register tools and resources, then feed it
 /// messages (e.g. via [`McpServer::run_stdio`]).
@@ -66,7 +74,28 @@ pub struct McpServer {
     /// Optional natural-language guidance for a model on using this server,
     /// returned by `server/discover`.
     instructions: Option<String>,
+    /// What this server tells clients about caching its cacheable results.
+    cache_policy: CachePolicy,
+    /// The `subscriptions/listen` streams currently open.
+    listeners: Arc<Listeners>,
+    /// How this server decides whether a returned `requestState` is one it
+    /// really minted. `None` accepts whatever comes back.
+    request_state_validator: Option<RequestStateValidator>,
 }
+
+/// Decides whether an echoed `requestState` is intact.
+///
+/// The 2026-07-28 revision has no session, so everything a server must
+/// remember between the rounds of a multi round-trip request travels through
+/// the client — which means the client is holding, and could edit, state the
+/// server is about to act on. Servers **MUST** reject state that fails
+/// integrity verification.
+///
+/// The scheme is deliberately the server's to choose: a signed token, an
+/// encrypted blob, a key into a store it keeps itself. All this library can do
+/// is guarantee the check happens before any handler sees the state, which is
+/// what registering one of these buys.
+pub type RequestStateValidator = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 impl McpServer {
     pub fn new(name: &str, version: &str, capabilities: Option<ServerCapabilities>) -> Self {
@@ -85,7 +114,48 @@ impl McpServer {
             max_buffer_size: crate::transports::limits::DEFAULT_MAX_BUFFER_SIZE,
             client_timeout: context::DEFAULT_CLIENT_TIMEOUT,
             instructions: None,
+            cache_policy: CachePolicy::default(),
+            listeners: Arc::new(Listeners::new()),
+            request_state_validator: None,
         }
+    }
+
+    /// Check every echoed `requestState` with `validator` before acting on it.
+    ///
+    /// A request whose state fails is refused with `-32602` and never reaches
+    /// a handler. See [`RequestStateValidator`] for why this is the server's
+    /// decision rather than the library's.
+    pub fn with_request_state_validator<F>(mut self, validator: F) -> Self
+    where
+        F: Fn(&str) -> bool + Send + Sync + 'static,
+    {
+        self.request_state_validator = Some(Arc::new(validator));
+        self
+    }
+
+    /// The `subscriptions/listen` streams currently open.
+    ///
+    /// A server announces changes through this: registering a tool at runtime
+    /// does not by itself tell anyone, because only the server knows whether a
+    /// change is one clients should re-fetch for.
+    ///
+    /// ```no_run
+    /// # use chuk_mcp::server::McpServer;
+    /// # let server = McpServer::new("s", "1.0.0", None);
+    /// server.listeners().tools_list_changed();
+    /// ```
+    pub fn listeners(&self) -> Arc<Listeners> {
+        self.listeners.clone()
+    }
+
+    /// What this server tells clients about caching its cacheable results.
+    ///
+    /// The default is deliberately conservative — see [`caching`] for why a
+    /// server that knows its tool list is the same for everyone should say so
+    /// with [`CachePolicy::with_scope`].
+    pub fn with_cache_policy(mut self, policy: CachePolicy) -> Self {
+        self.cache_policy = policy;
+        self
     }
 
     /// Natural-language guidance for a model on how to use this server,
@@ -141,6 +211,28 @@ impl McpServer {
     {
         self.tools
             .insert_interactive(name, schema, description, handler);
+    }
+
+    /// Register an interactive tool that cannot run unless the client declared
+    /// the given capabilities.
+    ///
+    /// `requires` names `ClientCapabilities` fields — `"sampling"`,
+    /// `"elicitation"`, `"roots"`. A 2026-era request that did not declare
+    /// them is refused with `-32021` before the handler runs, because a server
+    /// **MUST NOT** rely on a capability the request never claimed.
+    pub fn register_tool_requiring<F, Fut>(
+        &mut self,
+        name: &str,
+        schema: Value,
+        description: &str,
+        requires: &[&str],
+        handler: F,
+    ) where
+        F: Fn(Value, CallContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Value, String>> + Send + 'static,
+    {
+        self.tools
+            .insert_requiring(name, schema, description, requires, handler);
     }
 
     /// Register a resource with its async handler.
@@ -228,6 +320,25 @@ impl McpServer {
         prompts::register(&mut self.prompts, name, description, arguments, handler);
     }
 
+    /// Register a prompt whose handler shapes its own result.
+    ///
+    /// `prompts/get` is one of the three requests a 2026-era server may answer
+    /// with an `input_required` result, and that is not a list of messages —
+    /// so a prompt that might ask for something before rendering returns the
+    /// result itself. See [`crate::protocol::mrtr`].
+    pub fn register_raw_prompt<F, Fut>(
+        &mut self,
+        name: &str,
+        description: &str,
+        arguments: Vec<crate::protocol::messages::prompts::PromptArgument>,
+        handler: F,
+    ) where
+        F: Fn(serde_json::Map<String, Value>, CallContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Value, String>> + Send + 'static,
+    {
+        prompts::register_raw(&mut self.prompts, name, description, arguments, handler);
+    }
+
     /// Supply argument completions for `completion/complete`.
     pub fn register_completion<F, Fut>(&mut self, handler: F)
     where
@@ -252,13 +363,55 @@ impl McpServer {
         self.pending.clone()
     }
 
+    /// A registered tool's `inputSchema`, for the transport checks that need
+    /// to know which parameters the tool asked to be mirrored into headers.
+    pub(crate) fn tool_schema(&self, name: &str) -> Option<&Value> {
+        self.tools.schema(name)
+    }
+
+    /// Which capabilities this call needs that the request did not declare.
+    ///
+    /// Empty for a legacy request: that era declares its capabilities once
+    /// through `initialize`, so there is nothing per-request to check them
+    /// against and refusing on that basis would break it.
+    pub(crate) fn missing_capabilities(&self, message: &JsonRpcMessage) -> Vec<String> {
+        if message.method() != Some(MessageMethod::TOOLS_CALL)
+            || !modern::is_modern_request(message)
+        {
+            return Vec::new();
+        }
+        let params = params_object(message);
+        let Some(name) = params.get(FIELD_NAME).and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        let required = self.tools.requires(name);
+        if required.is_empty() {
+            return Vec::new();
+        }
+        modern::undeclared(message, required)
+    }
+
     /// Whether answering this message needs a channel back to the client while
     /// it is handled — a call to a tool that talks as it works.
     ///
     /// A transport asks before handling, because it decides then whether the
     /// answer can be a single message or has to be a stream.
     pub fn needs_stream(&self, message: &JsonRpcMessage) -> bool {
+        // A subscription *is* a stream: it produces nothing at all until
+        // something changes, and answering it with a single body would close
+        // the very channel it exists to open.
+        if message.method() == Some(MessageMethod::SUBSCRIPTIONS_LISTEN) {
+            return true;
+        }
         if message.method() != Some(MessageMethod::TOOLS_CALL) {
+            return false;
+        }
+        // A call that will be refused for a capability the client never
+        // declared has nothing to stream: it produces one error and stops.
+        // Deciding that here rather than after the stream is open is what lets
+        // the refusal carry its `400`, since an event stream is a `200` the
+        // moment it starts.
+        if !self.missing_capabilities(message).is_empty() {
             return false;
         }
         params_object(message)

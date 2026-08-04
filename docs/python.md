@@ -204,6 +204,88 @@ Available: `send_initialize`, `send_initialized_notification`, `send_tools_list`
 the era is settled and `_meta` injection lives in the transport, so the same
 `send_*` calls work whichever era was negotiated.
 
+## Serving `2026-07-28` from Python
+
+`chuk-mcp-server` brings its own HTTP serving and registries; what it needs
+from here is the wire contract, so there is one implementation of it rather
+than two. Everything below takes and returns plain dicts, so it can be used a
+message at a time.
+
+```python
+from chuk_mcp_rs import (
+    discover_result, is_modern_request, check_version,
+    missing_required_meta, is_removed_method,
+    stamp_result_type, stamp_cache_hints,
+    input_required_result, elicit_request,
+    subscription_filter, subscription_acknowledgement,
+)
+
+async def handle(message):
+    modern = is_modern_request(message)
+
+    # A modern request carries its version and the client's capabilities on
+    # every call. Missing either is malformed — answer -32602, and 400 on HTTP.
+    if modern and (why := missing_required_meta(message)):
+        return error(-32602, why)
+
+    # An unspeakable version is answered with the list this server can speak,
+    # and the version that was asked for, so the client can renegotiate.
+    if rejection := check_version(message):
+        return error(rejection["code"], rejection["message"], rejection["data"])
+
+    method = message["method"]
+
+    # The RPCs this revision removed answer -32601 (404 on HTTP) — but only
+    # for a modern request. A legacy one still gets them.
+    if modern and is_removed_method(method):
+        return error(-32601, f"Method not found: {method}")
+
+    result = await dispatch(method, message.get("params", {}))
+
+    if modern:
+        # Caching hints first: they belong on a `complete` result, which is
+        # what an unstamped one is. Only the six cacheable operations are
+        # touched, so this is safe to call on every result.
+        result = stamp_cache_hints(result, method, ttl_ms=60_000, scope="private")
+        result = stamp_result_type(result)
+    return result
+```
+
+`discover_result(name, version, capabilities, instructions)` builds the
+`server/discover` answer — versions under `supportedVersions`, identity in
+`_meta`, not shaped like the old `initialize` result.
+
+**Asking for more input.** A modern server does not send the client a request;
+it returns one and waits to be retried:
+
+```python
+return input_required_result(
+    input_requests={"user_name": elicit_request("What is your name?", {
+        "type": "object",
+        "properties": {"name": {"type": "string"}},
+        "required": ["name"],
+    })},
+    request_state="opaque-token-only-this-server-understands",
+)
+```
+
+The client retries the original request with `inputResponses` and the
+`requestState` echoed back. Verify that state before acting on it — with no
+session, the client has been holding what the server needs to remember.
+
+**Subscriptions.** `subscriptions/listen` replaced the HTTP `GET` endpoint and
+`resources/subscribe`. The acknowledgement must be the stream's first message,
+and every message on it carries the subscription id:
+
+```python
+ack = subscription_acknowledgement(request["id"], message["params"])
+await stream.send(ack)
+
+agreed = subscription_filter(message["params"])
+if agreed.get("toolsListChanged"):
+    ...  # and nothing the client did not ask for
+```
+
 ## Streamable HTTP
 
 ```python

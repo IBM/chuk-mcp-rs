@@ -116,6 +116,26 @@ let transport = SseTransport::start(params).await?;
 announcing where to POST. Present for compatibility with servers that have not
 migrated; prefer Streamable HTTP for anything new.
 
+## Authorization
+
+`with_bearer_token` is for a token you already hold. A server that answers
+`401` is asking the client to *obtain* one, which is the
+[`auth`](https://docs.rs/chuk-mcp/latest/chuk_mcp/auth/) module's job rather
+than the transport's: supply an `Auth` to `Connect` and the challenge is
+answered, the token attached to every request after, and a `403` naming a
+wider scope handled by re-authorizing for the union.
+
+```rust
+let client = Connect::to("https://example.com/mcp")
+    .authorization(Auth::new().handler(handler))
+    .connect()
+    .await?;
+```
+
+Both HTTP transports carry it, so the era a server turns out to speak does not
+change how it is authorized. See the README's
+[Authorizing](../README.md#authorizing) section for what a handler does.
+
 ## Limits
 
 Every transport bounds how much undelimited data a peer can send before it

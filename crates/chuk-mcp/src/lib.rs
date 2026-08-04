@@ -35,6 +35,11 @@
 //! # }
 //! ```
 
+/// OAuth 2.1 authorization for HTTP transports.
+///
+/// Behind the default-on `auth` feature.
+#[cfg(feature = "auth")]
+pub mod auth;
 pub mod client;
 pub mod connect;
 pub mod protocol;
