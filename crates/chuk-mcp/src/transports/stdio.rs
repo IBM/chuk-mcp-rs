@@ -122,7 +122,8 @@ impl StdioTransport {
             .unwrap_or_default();
         let suppress_stderr = matches!(log_level.as_str(), "ERROR" | "CRITICAL");
 
-        let mut child = Command::new(&parameters.command)
+        let mut command = Command::new(&parameters.command);
+        command
             .args(&parameters.args)
             .env_clear()
             .envs(&env)
@@ -132,12 +133,23 @@ impl StdioTransport {
                 Stdio::null()
             } else {
                 Stdio::inherit()
-            })
-            .process_group(0)
-            .spawn()
-            .map_err(|e| {
-                McpError::Transport(format!("Failed to start '{}': {e}", parameters.command))
-            })?;
+            });
+
+        // Its own process group, so a Ctrl-C delivered to this process's group
+        // does not also reach the server: killing it is this transport's job,
+        // and a terminal signal arriving first turns an orderly shutdown into
+        // a half-read stream.
+        //
+        // Unix only — `process_group` comes from `CommandExt` there, and
+        // Windows has no equivalent notion. Without it a console signal does
+        // reach the child on Windows, which is worse than the Unix behaviour
+        // but is what the platform offers.
+        #[cfg(unix)]
+        command.process_group(0);
+
+        let mut child = command.spawn().map_err(|e| {
+            McpError::Transport(format!("Failed to start '{}': {e}", parameters.command))
+        })?;
 
         let stdout = child
             .stdout
