@@ -6,7 +6,7 @@ members = ["crates/chuk-mcp", "crates/chuk-mcp-python"]
 version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/chrishayuk/chuk-mcp-rs"
+repository = "https://github.com/IBM/chuk-mcp-rs"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
