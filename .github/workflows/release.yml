@@ -1,5 +1,10 @@
 name: Release
 
+# See the note at the top of ci.yml: every action here must be GitHub-owned or
+# on the organisation's allowlist, or the run dies at startup before any job is
+# scheduled. That is why the toolchain and maturin are installed with `run:`
+# steps rather than by actions.
+
 on:
   push:
     tags: ["v*"]
@@ -13,21 +18,70 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
+  # ---- The gates, before anything is published ----------------------------
+  #
+  # `cargo publish` cannot be undone — a version can be yanked but never
+  # replaced. Publishing straight off a tag would mean the first time these
+  # checks ran against the released commit was never. So they run here, and
+  # the publish job waits on them.
+  verify:
+    name: Verify the tagged commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+        env:
+          PYO3_PYTHON: python3
+
+      - name: Test
+        run: cargo test --workspace
+        env:
+          PYO3_PYTHON: python3
+
+      - name: Test without default features
+        run: cargo test -p chuk-mcp --no-default-features
+
+      # The crate is what is about to be published: prove it packages and
+      # builds from the packaged tarball, not just from the working tree.
+      - name: Package check
+        run: cargo publish --dry-run -p chuk-mcp
+
   # ---- Rust crate -> crates.io -------------------------------------------
   publish-crate:
     name: Publish chuk-mcp to crates.io
+    needs: verify
     runs-on: ubuntu-latest
     # `github.event.inputs` rather than `inputs`: the latter context does not
-    # exist on a `push`, and referencing it there fails the whole workflow
-    # before any job starts — which is why no tag has ever published.
+    # exist on a `push`, and referencing it there is itself a startup failure.
     if: >-
       startsWith(github.ref, 'refs/tags/v') ||
       github.event.inputs.publish == 'true'
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+
+      - name: Install the Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
       - name: cargo publish
         run: cargo publish -p chuk-mcp
         env:
@@ -35,46 +89,58 @@ jobs:
 
   # ---- Python wheels -----------------------------------------------------
   wheels:
-    name: Wheels (${{ matrix.platform.os }} / ${{ matrix.platform.target }})
+    name: Wheels (${{ matrix.os }})
+    needs: verify
     strategy:
       fail-fast: false
       matrix:
-        platform:
-          - { os: ubuntu-latest, target: x86_64 }
-          - { os: ubuntu-latest, target: aarch64 }
-          - { os: macos-latest, target: aarch64 }
-          - { os: macos-13, target: x86_64 }
-          - { os: windows-latest, target: x64 }
-    runs-on: ${{ matrix.platform.os }}
+        # Native builds only. The cross-compiled manylinux targets the previous
+        # matrix claimed were produced by an action this organisation does not
+        # permit, so they were never actually built — listing them here would
+        # be describing a wheel nobody ships.
+        os: [ubuntu-latest, macos-latest, macos-13, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Build wheels
-        uses: PyO3/maturin-action@v1
-        with:
-          working-directory: crates/chuk-mcp-python
-          target: ${{ matrix.platform.target }}
-          args: --release --out dist
-          sccache: "true"
-          manylinux: auto
+
+      - name: Install the Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      # abi3 wheels: one build works across Python >= 3.9.
+      - name: Build the wheel
+        working-directory: crates/chuk-mcp-python
+        run: |
+          python -m pip install --upgrade pip maturin
+          maturin build --release --out dist
+
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.platform.os }}-${{ matrix.platform.target }}
+          name: wheels-${{ matrix.os }}
           path: crates/chuk-mcp-python/dist
 
   sdist:
     name: Source distribution
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build sdist
-        uses: PyO3/maturin-action@v1
+
+      - uses: actions/setup-python@v5
         with:
-          working-directory: crates/chuk-mcp-python
-          command: sdist
-          args: --out dist
+          python-version: "3.12"
+
+      - name: Build the sdist
+        working-directory: crates/chuk-mcp-python
+        run: |
+          python -m pip install --upgrade pip maturin
+          maturin sdist --out dist
+
       - uses: actions/upload-artifact@v4
         with:
           name: sdist

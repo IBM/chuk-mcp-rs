@@ -1,5 +1,17 @@
 name: CI
 
+# Every action used here is either GitHub-owned (`actions/*`) or on the
+# organisation's allowlist. That is not a style preference: the org permits
+# GitHub-owned, verified-creator and an explicit allowlist, and anything else
+# is refused *before* a job is scheduled — the run dies at startup with no log
+# to read. This file previously used `dtolnay/rust-toolchain`,
+# `Swatinem/rust-cache` and `taiki-e/install-action`, and so had never once
+# run. Adding an action here means checking it against that policy first.
+#
+# The toolchain steps below are plain `run:` lines because GitHub-hosted
+# runners ship rustup and a stable toolchain already; there is nothing an
+# action was buying us beyond a few seconds.
+
 on:
   push:
     branches: [main]
@@ -10,6 +22,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   test:
     name: Test & lint (Rust core + bindings)
@@ -17,15 +32,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      - name: Install the Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+          rustc --version && cargo --version
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-test-
 
       - name: Format check
         run: cargo fmt --all --check
@@ -61,16 +87,33 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+
+      - name: Install the Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      # Three stages, all blocking: our own rule suite (both eras, client and
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-conformance-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-conformance-
+
+      # Five stages, all blocking: our own rule suite (both eras, client and
       # server), the official @modelcontextprotocol/conformance client
-      # scenarios for 2025-06-18 and 2025-11-25, and the reference server
-      # scenarios. Client scenarios we do not pass yet would be listed in the
-      # script and reported without failing the build; that list is empty.
+      # scenarios at the legacy versions and at 2026-07-28 (authorization
+      # included), and the reference server scenarios at both. Client scenarios
+      # we do not pass yet would be listed in the script and reported without
+      # failing the build; that list is empty.
       - name: Conformance
         run: ./scripts/run-conformance.sh
 
@@ -79,14 +122,36 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
-      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Install the Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component llvm-tools-preview
+          rustup default stable
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.cargo/bin
+            target
+          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-coverage-
+
+      # Installed rather than fetched by an action, and skipped when the cache
+      # already has it — a couple of minutes on a cold cache, nothing on a warm
+      # one.
+      - name: Install cargo-llvm-cov
+        run: |
+          if ! command -v cargo-llvm-cov >/dev/null; then
+            cargo install cargo-llvm-cov --locked
+          fi
 
       # The demo-server binary is a subprocess fixture llvm-cov can't observe;
       # every other source file is held at >=90% line coverage individually.
@@ -103,17 +168,17 @@ jobs:
         run: python3 scripts/coverage-gate.py coverage.json --min-lines 90
 
   wheels:
-    name: Wheels (${{ matrix.platform.os }})
+    name: Wheels (${{ matrix.os }})
     needs: test
     strategy:
       fail-fast: false
       matrix:
-        platform:
-          - { os: ubuntu-latest, target: x86_64 }
-          - { os: macos-latest, target: aarch64 }
-          - { os: macos-13, target: x86_64 }
-          - { os: windows-latest, target: x64 }
-    runs-on: ${{ matrix.platform.os }}
+        # Native builds only. The cross-compiled manylinux targets the previous
+        # matrix claimed were produced by an action this organisation does not
+        # permit, so they were never actually built — listing them here would
+        # be describing a wheel nobody ships.
+        os: [ubuntu-latest, macos-latest, macos-13, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -121,20 +186,22 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Build wheels
-        uses: PyO3/maturin-action@v1
-        with:
-          working-directory: crates/chuk-mcp-python
-          target: ${{ matrix.platform.target }}
-          args: --release --out dist
-          # abi3 wheels: one build works across Python >= 3.9.
-          sccache: "true"
-          manylinux: auto
+      - name: Install the Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      # abi3 wheels: one build works across Python >= 3.9.
+      - name: Build the wheel
+        working-directory: crates/chuk-mcp-python
+        run: |
+          python -m pip install --upgrade pip maturin
+          maturin build --release --out dist
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.platform.os }}-${{ matrix.platform.target }}
+          name: wheels-${{ matrix.os }}
           path: crates/chuk-mcp-python/dist
 
   sdist:
@@ -143,12 +210,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build sdist
-        uses: PyO3/maturin-action@v1
+
+      - uses: actions/setup-python@v5
         with:
-          working-directory: crates/chuk-mcp-python
-          command: sdist
-          args: --out dist
+          python-version: "3.12"
+
+      - name: Build the sdist
+        working-directory: crates/chuk-mcp-python
+        run: |
+          python -m pip install --upgrade pip maturin
+          maturin sdist --out dist
+
       - uses: actions/upload-artifact@v4
         with:
           name: sdist
